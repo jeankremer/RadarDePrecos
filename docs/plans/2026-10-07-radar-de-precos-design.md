@@ -58,7 +58,7 @@ Cada loja é um **coletor** em Rust com a mesma interface:
 
 | Loja | Como |
 |---|---|
-| Mercado Livre | API oficial com OAuth de um app de desenvolvedor gratuito. O token é renovado automaticamente. Os itens acompanhados são consultados em lote (até 20 por chamada) |
+| Mercado Livre | API oficial com login do usuário (OAuth + PKCE) no app "Radar Ofertas JEV" do DevCenter. O token é renovado automaticamente. Os itens acompanhados são consultados em lote (até 20 por chamada). Validado em 07/10: sem token tudo dá 403, `client_credentials` não é aceito e o redirect `localhost` é recusado, então o app usa `https://gocomercio.com.br/oauth/mercadolivre/callback` e captura a navegação antes de carregar |
 | Amazon | HTTP direto em `amazon.com.br` com leitura do HTML. Se vier a página de verificação, tenta pelo navegador escondido; se continuar, pausa a loja e avisa. Sem nenhuma forma de burlar captcha: o usuário pode abrir a janela e resolver |
 | Shopee | Janela WebView2 invisível. Um script injetado captura as respostas JSON que a própria página recebe, em vez de ler o DOM. O login é feito pelo usuário uma vez nessa janela e a sessão fica salva |
 
