@@ -10,7 +10,8 @@ O desenho e os planos ficam em [docs/plans/](docs/plans/).
 |---|---|---|
 | Buscar | `Ctrl+1` | Busca no catálogo do Mercado Livre. Cada cartão é um produto com o menor preço novo entre os vendedores, preço "de", Full e frete grátis |
 | Acompanhando | `Ctrl+2` | Produtos acompanhados com o menor preço atual, o menor já visto, a variação e um mini gráfico de 30 dias. **Checar agora** consulta todos. Clicar num produto abre o histórico em gráfico e os links |
-| Ajustes | | Conta do Mercado Livre, backup e restauração |
+| Alertas | `Ctrl+3` | Quedas de preço, preço-alvo atingido, menor preço já visto e produtos que voltaram a ter oferta. O número na barra lateral conta os novos |
+| Ajustes | | Conta do Mercado Livre, checagem automática, backup e restauração |
 
 `Ctrl+F` vai para o campo de busca ou para o campo de link.
 
@@ -30,6 +31,23 @@ Um **produto** do Radar pode juntar mais de um link (por exemplo, cores diferent
 linha por link, e a lista mostra o menor preço entre eles. O histórico só grava um ponto quando algo muda, ou um por
 dia de checagem, e os valores ficam em centavos.
 
+## Checagem automática e avisos
+
+- O Radar checa os preços sozinho no intervalo escolhido em **Ajustes** (padrão: a cada 3 horas). As consultas são
+  espaçadas de 5 a 15 s entre produtos. Se uma rodada inteira falhar, o próximo intervalo dobra, até 24 h.
+- **Fechar a janela não encerra o app**: ele continua perto do relógio. O ícone tem **Abrir o Radar**, **Checar agora**
+  e **Sair**. Abrir o app de novo mostra a janela que já está aberta.
+- **Iniciar com o Windows** (em Ajustes) abre o Radar direto na bandeja.
+- **Avisos por produto** (no detalhe do produto): preço-alvo, queda mínima (padrão 5%) e menor preço já visto. Cada
+  rodada gera no máximo um aviso por produto, nesta ordem: preço-alvo, menor já visto, queda, voltou a ter oferta. A
+  primeira checagem de um produto nunca avisa.
+- **Leitura suspeita**: uma queda de mais de 60% não é gravada na hora. O app checa de novo depois de 10 minutos e só
+  grava e avisa se o preço se confirmar (diferença de até 2%).
+- **Desconto inflado**: aparece quando o preço "de" passa em mais de 5% o maior preço visto nos últimos 30 dias, com
+  pelo menos uma semana de histórico.
+- Os avisos ficam em **Alertas** e aparecem como notificação do Windows (dá para desligar em Ajustes). No Windows, clicar
+  na notificação não abre o produto, mas o aviso fica em Alertas.
+
 ## Conectar o Mercado Livre
 
 1. O app de desenvolvedor é o **Radar Ofertas JEV**, no DevCenter do Mercado Livre. O Client ID e a URI de redirect já
@@ -44,8 +62,8 @@ Se ficar muito tempo sem uso, o app pede para conectar de novo.
 
 ## Onde ficam os dados
 
-`%APPDATA%\com.jeank.radar\radar.db` (SQLite) e `config.json`, que guarda a pasta de backup, o Client ID, a URI de
-redirect e o apelido da conta.
+`%APPDATA%\com.jeank.radar\radar.db` (SQLite, com produtos, histórico e alertas) e `config.json`, que guarda a pasta de
+backup, o Client ID, a URI de redirect, o apelido da conta e as opções de checagem automática.
 
 ## Backup
 
@@ -94,10 +112,13 @@ src/                  interface (HTML/CSS/JS)
   search.js           tela Buscar
   products.js         tela Acompanhando e detalhe do produto
   track.js            diálogo "Acompanhar"
-  settings.js         Ajustes: Mercado Livre e backup
+  alerts.js           tela Alertas
+  settings.js         Ajustes: Mercado Livre, checagem automática e backup
   dev-mock.js         backend simulado (só no navegador, em desenvolvimento)
 src-tauri/src/        núcleo em Rust
-  lib.rs              comandos, configuração, login e acesso à API
+  lib.rs              comandos, configuração, login, acesso à API, bandeja e janela
+  checker.rs          rodada de checagem, leitura suspeita, alertas e agendador
+  alerts.rs           regras de alerta e de promoção inflada (puras, testadas)
   db.rs               banco SQLite: produtos, links e histórico
   prices.rs           regras do histórico (quando gravar, melhor preço por dia)
   ml.rs               leitura das respostas da API do Mercado Livre
