@@ -75,6 +75,11 @@ mockIPC((cmd, args) => {
       products = products.filter((p) => p.links.length);
       return null;
     case 'check_now': return later({ checked: 2, changed: 1, failed: 0, alerts: 0, suspicious: 0 }, 800);
+    case 'current_offers': return later([{ linkId: 1, title: 'SSD Kingston NV3 1TB M.2 2280', sellersNote: null, error: null, offers: [
+      { itemId: 'MLB5292960991', url: url('MLB39766120'), price: 99700, listPrice: 144900, condition: 'new', freeShipping: true, full: false, flex: true, officialStore: false, sellerId: 1, sellerPlace: 'Medianeira, Paraná', seller: { nickname: 'ZJ20240525213249', level: '5_green', powerSeller: null, sales: 12345 } },
+      { itemId: 'MLB7740531792', url: url('MLB39766120'), price: 99990, listPrice: null, condition: 'new', freeShipping: true, full: true, flex: false, officialStore: true, sellerId: 2, sellerPlace: 'São Paulo, São Paulo', seller: { nickname: 'KINGSTON', level: '5_green', powerSeller: 'platinum', sales: 1500 } },
+      { itemId: 'MLB4880764075', url: url('MLB39766120'), price: 101200, listPrice: null, condition: 'new', freeShipping: false, full: false, flex: false, officialStore: false, sellerId: 3, sellerPlace: 'Curitiba, Paraná', seller: null },
+    ] }], 400);
     case 'update_rules': Object.assign(products.find((x) => x.id === args.id), { targetPrice: args.target, minDropPct: args.minDropPct, notifyLowest: args.notifyLowest }); return null;
     case 'list_alerts': return alerts;
     case 'unread_alerts': return alerts.filter((a) => !a.read).length;

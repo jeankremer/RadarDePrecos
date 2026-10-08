@@ -179,6 +179,132 @@ pub fn offer(p: CatalogProduct, b: BestOffer) -> Offer {
     }
 }
 
+/// Uma oferta (anúncio) de um produto do catálogo, para a tabela "Ofertas agora".
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfferRow {
+    pub item_id: String,
+    /// Página do produto com essa oferta escolhida.
+    pub url: String,
+    pub price: i64,
+    pub list_price: Option<i64>,
+    pub condition: String,
+    pub free_shipping: bool,
+    /// Sai do armazém do Mercado Livre.
+    pub full: bool,
+    /// O vendedor entrega no mesmo dia em algumas cidades.
+    pub flex: bool,
+    pub official_store: bool,
+    pub seller_id: u64,
+    /// "Medianeira, Paraná".
+    pub seller_place: Option<String>,
+    pub seller: Option<SellerInfo>,
+}
+
+/// Dados públicos do vendedor (`/users`), quando a API libera.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SellerInfo {
+    pub nickname: String,
+    /// "5_green" (melhor) a "1_red".
+    pub level: Option<String>,
+    /// "platinum", "gold" ou "silver" (MercadoLíder).
+    pub power_seller: Option<String>,
+    pub sales: Option<u64>,
+}
+
+/// Todas as ofertas de `/products/{id}/items`, da mais barata para a mais cara.
+pub fn parse_offers(product_id: &str, json: &str) -> Result<Vec<OfferRow>, String> {
+    #[derive(Deserialize)]
+    struct Named {
+        name: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Address {
+        city: Option<Named>,
+        state: Option<Named>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Ship {
+        #[serde(default)]
+        free_shipping: bool,
+        logistic_type: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct Item {
+        item_id: String,
+        price: Option<f64>,
+        original_price: Option<f64>,
+        condition: Option<String>,
+        official_store_id: Option<u64>,
+        seller_id: u64,
+        seller_address: Option<Address>,
+        shipping: Option<Ship>,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        results: Vec<Item>,
+    }
+    let resp: Resp = serde_json::from_str(json).map_err(|e| format!("Resposta inesperada das ofertas: {e}"))?;
+    let mut rows: Vec<OfferRow> = resp
+        .results
+        .into_iter()
+        .filter_map(|i| {
+            let price = to_cents(i.price?);
+            let ship = i.shipping.unwrap_or_default();
+            let place = i.seller_address.map(|a| {
+                [a.city.and_then(|c| c.name), a.state.and_then(|s| s.name)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            Some(OfferRow {
+                url: format!("{}?pdp_filters=item_id:{}", product_url(product_id), i.item_id),
+                item_id: i.item_id,
+                price,
+                list_price: list_price(price, i.original_price),
+                condition: i.condition.unwrap_or_else(|| "new".into()),
+                free_shipping: ship.free_shipping,
+                full: ship.logistic_type.as_deref() == Some("fulfillment"),
+                flex: ship.tags.iter().any(|t| t == "self_service_in"),
+                official_store: i.official_store_id.is_some(),
+                seller_id: i.seller_id,
+                seller_place: place.filter(|p| !p.is_empty()),
+                seller: None,
+            })
+        })
+        .collect();
+    rows.sort_by_key(|r| r.price);
+    Ok(rows)
+}
+
+/// Vendedores de `/users?ids=…`. Aceita a resposta em lote (`[{code, body}]`) ou a lista direta.
+pub fn parse_sellers(json: &str) -> std::collections::HashMap<u64, SellerInfo> {
+    let Ok(serde_json::Value::Array(list)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Default::default();
+    };
+    list.iter()
+        .filter(|e| e.get("code").map_or(true, |c| c == 200))
+        .map(|e| e.get("body").unwrap_or(e))
+        .filter_map(|u| {
+            let rep = &u["seller_reputation"];
+            Some((
+                u["id"].as_u64()?,
+                SellerInfo {
+                    nickname: u["nickname"].as_str()?.to_string(),
+                    level: rep["level_id"].as_str().map(String::from),
+                    power_seller: rep["power_seller_status"].as_str().map(String::from),
+                    sales: rep["transactions"]["completed"].as_u64(),
+                },
+            ))
+        })
+        .collect()
+}
+
 pub fn parse_nickname(json: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Me {
@@ -309,6 +435,34 @@ mod tests {
         let p = CatalogProduct { id: "MLB39766120".into(), name: "SSD".into(), image: None };
         let o = offer(p, BestOffer { price: 99700, list_price: None, free_shipping: true, full: false, sellers: 3 });
         assert_eq!((o.code.as_str(), o.url.as_str(), o.sellers), ("MLB39766120", "https://www.mercadolivre.com.br/p/MLB39766120", 3));
+    }
+
+    #[test]
+    fn lista_as_ofertas_do_produto() {
+        let rows = parse_offers("MLB39766120", include_str!("../tests/fixtures/ml/product-items.json")).unwrap();
+        assert_eq!(rows.len(), 100);
+        assert!(rows.windows(2).all(|w| w[0].price <= w[1].price), "da mais barata para a mais cara");
+        let a = &rows[0];
+        assert_eq!((a.item_id.as_str(), a.price, a.list_price), ("MLB5292960991", 99700, Some(144900)));
+        assert_eq!(a.url, "https://www.mercadolivre.com.br/p/MLB39766120?pdp_filters=item_id:MLB5292960991");
+        assert!(a.free_shipping && a.flex && !a.full && !a.official_store);
+        assert_eq!((a.seller_id, a.seller_place.as_deref()), (3712164868, Some("Medianeira, Paraná")));
+        assert!(rows.iter().any(|r| r.full), "tem oferta Full");
+        assert!(rows.iter().any(|r| r.official_store), "tem loja oficial");
+    }
+
+    #[test]
+    fn le_os_vendedores() {
+        let lote = r#"[
+            {"code":200,"body":{"id":1,"nickname":"LOJA A","seller_reputation":{"level_id":"5_green","power_seller_status":"platinum","transactions":{"completed":12345}}}},
+            {"code":404,"body":{"message":"not found"}},
+            {"code":200,"body":{"id":2,"nickname":"LOJA B","seller_reputation":{"level_id":null,"power_seller_status":null,"transactions":{"completed":0}}}}]"#;
+        let s = parse_sellers(lote);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[&1], SellerInfo { nickname: "LOJA A".into(), level: Some("5_green".into()), power_seller: Some("platinum".into()), sales: Some(12345) });
+        assert_eq!((s[&2].level.clone(), s[&2].sales), (None, Some(0)));
+        assert_eq!(parse_sellers(r#"[{"id":3,"nickname":"DIRETO"}]"#)[&3].nickname, "DIRETO");
+        assert!(parse_sellers(r#"{"message":"forbidden"}"#).is_empty());
     }
 
     #[test]

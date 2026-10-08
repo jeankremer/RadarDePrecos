@@ -499,6 +499,59 @@ async fn check_now(app: AppHandle) -> CmdResult<checker::CheckSummary> {
     checker::run_check(&app, false, None).await
 }
 
+/// Ofertas de um link na hora em que o detalhe é aberto (não ficam no banco).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkOffers {
+    link_id: i64,
+    title: String,
+    offers: Vec<ml::OfferRow>,
+    /// Por que os nomes dos vendedores não vieram, quando não vieram.
+    sellers_note: Option<String>,
+    error: Option<String>,
+}
+
+/// Ofertas por página de `/products/{id}/items` (já vêm da mais barata para a mais cara).
+const OFFERS_LIMIT: &str = "50";
+/// Vendedores por consulta em lote de `/users`.
+const USERS_BATCH: usize = 20;
+
+#[tauri::command]
+async fn current_offers(app: AppHandle, state: State<'_, AppState>, id: i64) -> CmdResult<Vec<LinkOffers>> {
+    let links = db::product_detail(&lock(&state.db), id, &today()).map_err(err)?.product.links;
+    let mut out = Vec::new();
+    for link in links.into_iter().filter(|l| l.store == ml::STORE) {
+        let mut row = LinkOffers { link_id: link.id, title: link.title, offers: Vec::new(), sellers_note: None, error: None };
+        match ml_get(&app, &state, &format!("/products/{}/items", link.code), &[("limit", OFFERS_LIMIT)]).await {
+            Ok(body) => match ml::parse_offers(&link.code, &body) {
+                Ok(offers) => row.offers = offers,
+                Err(e) => row.error = Some(e),
+            },
+            Err(ml::ApiError::NotFound) => {}
+            Err(e) => row.error = Some(e.to_string()),
+        }
+        let mut ids: Vec<u64> = row.offers.iter().map(|o| o.seller_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut sellers = std::collections::HashMap::new();
+        for chunk in ids.chunks(USERS_BATCH) {
+            let joined = chunk.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+            match ml_get(&app, &state, "/users", &[("ids", joined.as_str())]).await {
+                Ok(body) => sellers.extend(ml::parse_sellers(&body)),
+                Err(e) => {
+                    row.sellers_note = Some(format!("Nomes dos vendedores indisponíveis: {e}"));
+                    break;
+                }
+            }
+        }
+        for o in &mut row.offers {
+            o.seller = sellers.get(&o.seller_id).cloned();
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 fn update_rules(state: State<'_, AppState>, id: i64, target: Option<i64>, min_drop_pct: f64, notify_lowest: bool) -> CmdResult<()> {
     if !(0.0..=90.0).contains(&min_drop_pct) {
@@ -800,6 +853,7 @@ pub fn run() {
             backup_now,
             restore_backup,
             update_rules,
+            current_offers,
             list_alerts,
             unread_alerts,
             mark_alerts_read,

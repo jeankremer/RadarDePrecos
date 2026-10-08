@@ -1,7 +1,7 @@
 // Tela "Acompanhando": lista de produtos, adicionar por link, checar agora e detalhe com histórico.
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { call, esc, toast, setBusy } from './core.js';
-import { brl, pct, ago, STORES, parseCents } from './format.js';
+import { brl, pct, ago, STORES, parseCents, discount, salesLabel, powerSellerLabel } from './format.js';
 import { sparkline, stepChart } from './charts.js';
 import { chooseProduct } from './track.js';
 
@@ -152,6 +152,7 @@ async function showDetail(id) {
         <button class="primary" id="check"><i class="ti ti-refresh"></i> Checar agora</button>
       </div>
       <section class="card">${stepChart(series)}</section>
+      <section class="card" id="offers"><h3><i class="ti ti-list-details"></i> Ofertas agora</h3><p class="muted">Consultando as ofertas no Mercado Livre…</p></section>
       <section class="card">
         <h3>Links</h3>
         <table class="links">
@@ -175,6 +176,7 @@ async function showDetail(id) {
     </div>`;
 
   $('#back').onclick = () => showList();
+  loadOffers(id);
   $('#check').onclick = (e) => checkNow(e.currentTarget);
   const name = $('#pname');
   name.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); name.blur(); } };
@@ -234,4 +236,79 @@ function linkRow(l) {
         <button class="icon ghost small danger" data-unlink="${l.id}" title="Remover este link"><i class="ti ti-unlink"></i></button>
       </td>
     </tr>`;
+}
+
+// ---------- ofertas agora ----------
+
+let freeOnly = false;
+let offersData = [];
+
+/** Busca as ofertas de cada link na hora (não ficam no banco) e desenha a tabela. */
+async function loadOffers(id) {
+  try {
+    offersData = await call('current_offers', { id });
+  } catch {
+    offersData = [];
+  }
+  if (openId === id && root.isConnected) paintOffers();
+}
+
+const LEVELS = { '5_green': 'Reputação ótima', '4_light_green': 'Reputação boa', '3_yellow': 'Reputação regular', '2_orange': 'Reputação ruim', '1_red': 'Reputação muito ruim' };
+
+function sellerCell(o) {
+  const s = o.seller;
+  const name = s ? esc(s.nickname) : `Vendedor nº ${o.sellerId}`;
+  const lines = [
+    o.officialStore ? '<span class="tag">Loja oficial</span>' : '',
+    s?.powerSeller ? `<span class="ok-text">${powerSellerLabel(s.powerSeller)}</span>` : '',
+    s?.sales != null ? `<span class="muted">${salesLabel(s.sales)}</span>` : '',
+    o.sellerPlace ? `<span class="muted">${esc(o.sellerPlace)}</span>` : '',
+  ].filter(Boolean);
+  const level = s?.level ? `<i class="rep rep-${esc(s.level)}" title="${LEVELS[s.level] || ''}"></i>` : '';
+  return `<b>${level}${name}</b>${lines.length ? `<div class="sub">${lines.join(' · ')}</div>` : ''}`;
+}
+
+function offerRow(o) {
+  const d = discount(o.price, o.listPrice);
+  const delivery = [
+    o.freeShipping ? '<span class="ok-text">Frete grátis</span>' : '<span class="muted">Frete pago</span>',
+    o.full ? '<span class="tag">Full</span>' : '',
+    o.flex ? '<span class="tag" title="Entrega no mesmo dia em algumas cidades">Flex</span>' : '',
+  ].filter(Boolean).join(' ');
+  return `
+    <tr>
+      <td class="oprice"><b>${brl(o.price)}</b>${d ? `<div class="sub"><s>${brl(o.listPrice)}</s> <span class="off">-${d}%</span></div>` : ''}</td>
+      <td>${o.condition === 'new' ? 'Novo' : o.condition === 'used' ? 'Usado' : 'Recondicionado'}</td>
+      <td>${delivery}</td>
+      <td>${sellerCell(o)}</td>
+      <td class="row-actions"><button class="icon ghost small" data-open="${esc(o.url)}" title="Abrir esta oferta no Mercado Livre"><i class="ti ti-external-link"></i></button></td>
+    </tr>`;
+}
+
+function paintOffers() {
+  const card = $('#offers');
+  if (!card) return;
+  const many = offersData.length > 1;
+  const total = offersData.reduce((n, l) => n + l.offers.length, 0);
+  const groups = offersData.map((l) => {
+    const rows = l.offers.filter((o) => !freeOnly || o.freeShipping);
+    return `
+      ${many ? `<h4 class="ogroup">${esc(l.title)}</h4>` : ''}
+      ${l.error ? `<p class="error">${esc(l.error)}</p>` : ''}
+      ${rows.length ? `
+        <table class="links offers-table">
+          <thead><tr><th>Preço</th><th>Condição</th><th>Entrega</th><th>Vendedor</th><th></th></tr></thead>
+          <tbody>${rows.map(offerRow).join('')}</tbody>
+        </table>` : `<p class="muted">${l.offers.length ? 'Nenhuma oferta com frete grátis.' : 'Ninguém está vendendo este produto agora.'}</p>`}
+      ${l.sellersNote ? `<p class="muted small">${esc(l.sellersNote)}</p>` : ''}`;
+  }).join('');
+  card.innerHTML = `
+    <div class="ohead">
+      <h3><i class="ti ti-list-details"></i> Ofertas agora <span class="muted">(${total})</span></h3>
+      <label class="check"><input type="checkbox" id="ofree" ${freeOnly ? 'checked' : ''}> Só frete grátis</label>
+    </div>
+    ${groups || '<p class="muted">Nenhum link do Mercado Livre neste produto.</p>'}
+    <p class="muted small">Parcelas e datas de entrega não vêm pela API do Mercado Livre; abra a oferta para ver.</p>`;
+  $('#ofree').onchange = (e) => { freeOnly = e.target.checked; paintOffers(); };
+  card.querySelectorAll('[data-open]').forEach((b) => (b.onclick = () => openUrl(b.dataset.open)));
 }

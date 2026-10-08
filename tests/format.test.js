@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { brl, pct, discount, ago, esc, alertText, parseCents } from '../src/format.js';
+import { brl, pct, discount, ago, esc, alertText, parseCents, salesLabel, powerSellerLabel } from '../src/format.js';
 
 test('brl formata centavos em reais', () => {
   assert.equal(brl(123450).replace(/\s/g, ' '), 'R$ 1.234,50');
@@ -49,4 +49,15 @@ test('parseCents lê valores em reais', () => {
   assert.equal(parseCents('abc'), undefined);
   assert.equal(parseCents('-5'), undefined);
   assert.equal(parseCents('0'), undefined);
+});
+
+test('vendas e MercadoLíder como no Mercado Livre', () => {
+  assert.equal(salesLabel(12345), '+12 mil vendas');
+  assert.equal(salesLabel(1500), '+1000 vendas');
+  assert.equal(salesLabel(560), '+500 vendas');
+  assert.equal(salesLabel(1), '1 venda');
+  assert.equal(salesLabel(0), '0 vendas');
+  assert.equal(salesLabel(null), '');
+  assert.equal(powerSellerLabel('platinum'), 'MercadoLíder Platinum');
+  assert.equal(powerSellerLabel(null), '');
 });

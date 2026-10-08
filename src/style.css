@@ -807,3 +807,18 @@ table.links td { padding: 8px; border-bottom: 1px solid var(--border); vertical-
 .check-form label { display: flex; align-items: center; gap: 6px; }
 .check-form select { width: auto; height: 32px; }
 .check-form input[type=checkbox] { width: auto; height: auto; }
+.ohead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.ohead h3 { margin: 0; }
+.ohead .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+.ohead .check input { width: auto; height: auto; }
+.ogroup { margin: 14px 0 6px; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.offers-table td { vertical-align: middle; }
+.offers-table .oprice b { font-size: 15px; }
+.offers-table .sub { font-size: 12px; margin-top: 2px; }
+.offers-table .sub s { color: var(--text-3); }
+.rep { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+.rep-5_green { background: #22c55e; }
+.rep-4_light_green { background: #86efac; }
+.rep-3_yellow { background: #facc15; }
+.rep-2_orange { background: #fb923c; }
+.rep-1_red { background: #ef4444; }

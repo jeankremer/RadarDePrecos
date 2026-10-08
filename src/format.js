@@ -69,3 +69,17 @@ export function parseCents(text) {
   const cents = Number(int) * 100 + Number(dec.padEnd(2, '0'));
   return cents > 0 ? cents : undefined;
 }
+
+/** Vendas no formato do Mercado Livre: "+10 mil vendas", "+1000 vendas", "+500 vendas", "2 vendas". */
+export function salesLabel(n) {
+  if (n == null) return '';
+  if (n >= 10000) return `+${Math.floor(n / 1000)} mil vendas`;
+  if (n >= 1000) return `+${Math.floor(n / 1000) * 1000} vendas`;
+  if (n >= 100) return `+${Math.floor(n / 100) * 100} vendas`;
+  return `${n} ${n === 1 ? 'venda' : 'vendas'}`;
+}
+
+/** "platinum" → "MercadoLíder Platinum". */
+export function powerSellerLabel(status) {
+  return { platinum: 'MercadoLíder Platinum', gold: 'MercadoLíder Gold', silver: 'MercadoLíder' }[status] || '';
+}
