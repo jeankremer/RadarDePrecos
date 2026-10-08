@@ -1,5 +1,6 @@
 //! Núcleo do Radar de Preços: banco local, Mercado Livre e comandos da interface.
 
+mod db;
 mod prices;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
