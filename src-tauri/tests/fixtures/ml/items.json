@@ -1,9 +1,0 @@
-[
-  { "code": 200, "body": { "id": "MLB3456789012", "title": "SSD Kingston NV2 1TB M.2 NVMe", "price": 379.9, "original_price": 499.9,
-      "status": "active", "available_quantity": 12, "permalink": "https://produto.mercadolivre.com.br/MLB-3456789012-ssd-_JM",
-      "thumbnail": "http://http2.mlstatic.com/D_1.jpg", "shipping": { "free_shipping": true, "logistic_type": "fulfillment" } } },
-  { "code": 200, "body": { "id": "MLB2222222222", "title": "SSD Sandisk 1TB", "price": 359, "original_price": null,
-      "status": "paused", "available_quantity": 0, "permalink": "https://produto.mercadolivre.com.br/MLB-2222222222-ssd-_JM",
-      "thumbnail": "https://http2.mlstatic.com/D_2.jpg", "shipping": { "free_shipping": false } } },
-  { "code": 404, "body": { "message": "Item with id MLB9999999999 not found", "error": "not_found", "status": 404, "cause": [] } }
-]

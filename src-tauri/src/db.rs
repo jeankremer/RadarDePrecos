@@ -204,12 +204,6 @@ pub fn record_failure(c: &Connection, link_id: i64, msg: &str, now: &str) -> rus
     Ok(())
 }
 
-/// Atualiza título e foto quando a loja muda o anúncio.
-pub fn update_link_meta(c: &Connection, link_id: i64, title: &str, image: Option<&str>) -> rusqlite::Result<()> {
-    c.execute("UPDATE links SET title = ?2, image = COALESCE(?3, image) WHERE id = ?1", params![link_id, title, image])?;
-    Ok(())
-}
-
 /// Links de uma loja em produtos ativos: (id do link, código na loja).
 pub fn links_to_check(c: &Connection, store: &str) -> rusqlite::Result<Vec<(i64, String)>> {
     let mut stmt = c.prepare(

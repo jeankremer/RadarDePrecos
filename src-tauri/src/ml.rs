@@ -1,4 +1,8 @@
 //! Mercado Livre: leitura das respostas da API oficial e chamadas HTTP.
+//!
+//! O app trabalha com **produtos do catálogo**: para apps não certificados, a API recusa (403) a busca de
+//! anúncios e a consulta de anúncios (`/items`), mas libera a busca no catálogo e a lista de ofertas de
+//! cada produto (`/products/{id}/items`), que já vem do menor preço para o maior.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,12 +11,14 @@ use crate::prices::Reading;
 pub const STORE: &str = "ml";
 pub const SITE: &str = "MLB";
 const API: &str = "https://api.mercadolibre.com";
-/// Máximo de anúncios por consulta em lote.
-pub const BATCH: usize = 20;
-/// Campos pedidos na consulta em lote, para respostas menores.
-pub const ITEM_ATTRS: &str = "id,title,price,original_price,status,available_quantity,permalink,thumbnail,shipping";
 
-/// Um resultado de busca, já em centavos. Também é o que a interface manda de volta para "Acompanhar".
+/// Página do produto no catálogo (a API devolve `permalink` vazio).
+pub fn product_url(id: &str) -> String {
+    format!("https://www.mercadolivre.com.br/p/{id}")
+}
+
+/// Um produto do catálogo com o menor preço entre as ofertas, já em centavos.
+/// Também é o que a interface manda de volta para "Acompanhar".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Offer {
@@ -25,17 +31,26 @@ pub struct Offer {
     pub list_price: Option<i64>,
     pub free_shipping: bool,
     pub full: bool,
-    pub seller: Option<String>,
+    /// Quantos anúncios vendem o produto.
+    pub sellers: u32,
 }
 
-/// Um anúncio consultado pelo código.
+/// Nome e foto de um produto do catálogo.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ItemInfo {
-    pub code: String,
-    pub title: String,
-    pub url: String,
+pub struct CatalogProduct {
+    pub id: String,
+    pub name: String,
     pub image: Option<String>,
-    pub reading: Reading,
+}
+
+/// A oferta nova mais barata de um produto.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BestOffer {
+    pub price: i64,
+    pub list_price: Option<i64>,
+    pub free_shipping: bool,
+    pub full: bool,
+    pub sellers: u32,
 }
 
 pub fn to_cents(v: f64) -> i64 {
@@ -55,6 +70,47 @@ fn list_price(price: i64, original: Option<f64>) -> Option<i64> {
     original.map(to_cents).filter(|&o| o > price)
 }
 
+#[derive(Deserialize)]
+struct Picture {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ProductBody {
+    id: String,
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    pictures: Vec<Picture>,
+}
+
+impl From<ProductBody> for CatalogProduct {
+    fn from(p: ProductBody) -> Self {
+        CatalogProduct { id: p.id, name: p.name, image: https(p.pictures.into_iter().next().map(|pic| pic.url)) }
+    }
+}
+
+/// Busca no catálogo (`/products/search`): só produtos ativos.
+pub fn parse_catalog_search(json: &str) -> Result<Vec<CatalogProduct>, String> {
+    #[derive(Deserialize)]
+    struct Resp {
+        results: Vec<ProductBody>,
+    }
+    let resp: Resp = serde_json::from_str(json).map_err(|e| format!("Resposta inesperada da busca do Mercado Livre: {e}"))?;
+    Ok(resp
+        .results
+        .into_iter()
+        .filter(|p| p.status.as_deref().map_or(true, |s| s == "active"))
+        .map(CatalogProduct::from)
+        .collect())
+}
+
+/// Produto do catálogo (`/products/{id}`).
+pub fn parse_product(json: &str) -> Option<CatalogProduct> {
+    serde_json::from_str::<ProductBody>(json).ok().map(CatalogProduct::from)
+}
+
 #[derive(Deserialize, Default)]
 struct Shipping {
     #[serde(default)]
@@ -62,136 +118,65 @@ struct Shipping {
     logistic_type: Option<String>,
 }
 
-impl Shipping {
-    /// "Full": o produto sai do armazém do Mercado Livre.
-    fn full(&self) -> bool {
-        self.logistic_type.as_deref() == Some("fulfillment")
+/// Ofertas de um produto (`/products/{id}/items`): a nova mais barata, ou `None` se não houver.
+/// Usadas e recondicionadas ficam de fora para não comparar coisas diferentes.
+pub fn parse_product_items(json: &str) -> Option<BestOffer> {
+    #[derive(Deserialize)]
+    struct Item {
+        price: Option<f64>,
+        original_price: Option<f64>,
+        condition: Option<String>,
+        shipping: Option<Shipping>,
     }
-}
-
-#[derive(Deserialize)]
-struct SearchResp {
-    results: Vec<SearchItem>,
-}
-
-#[derive(Deserialize)]
-struct SearchItem {
-    id: String,
-    title: String,
-    price: Option<f64>,
-    original_price: Option<f64>,
-    permalink: String,
-    thumbnail: Option<String>,
-    shipping: Option<Shipping>,
-    seller: Option<Seller>,
-}
-
-#[derive(Deserialize)]
-struct Seller {
-    nickname: Option<String>,
-}
-
-pub fn parse_search(json: &str) -> Result<Vec<Offer>, String> {
-    let resp: SearchResp =
-        serde_json::from_str(json).map_err(|e| format!("Resposta inesperada da busca do Mercado Livre: {e}"))?;
-    Ok(resp
+    #[derive(Deserialize)]
+    struct Paging {
+        total: u32,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        results: Vec<Item>,
+        paging: Option<Paging>,
+    }
+    let resp: Resp = serde_json::from_str(json).ok()?;
+    let total = resp.paging.map_or(resp.results.len() as u32, |p| p.total);
+    let best = resp
         .results
         .into_iter()
-        .filter_map(|it| {
-            let price = to_cents(it.price?);
-            let ship = it.shipping.unwrap_or_default();
-            Some(Offer {
-                store: STORE.into(),
-                code: it.id,
-                title: it.title,
-                url: it.permalink,
-                image: https(it.thumbnail),
-                price,
-                list_price: list_price(price, it.original_price),
-                free_shipping: ship.free_shipping,
-                full: ship.full(),
-                seller: it.seller.and_then(|s| s.nickname),
-            })
-        })
-        .collect())
+        .filter(|i| i.condition.as_deref().map_or(true, |c| c == "new"))
+        .filter_map(|i| i.price.map(|p| (to_cents(p), i)))
+        .min_by_key(|(price, _)| *price)?;
+    let (price, item) = best;
+    let ship = item.shipping.unwrap_or_default();
+    Some(BestOffer {
+        price,
+        list_price: list_price(price, item.original_price),
+        free_shipping: ship.free_shipping,
+        full: ship.logistic_type.as_deref() == Some("fulfillment"),
+        sellers: total,
+    })
 }
 
-#[derive(Deserialize)]
-struct BatchEntry {
-    code: u16,
-    body: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct ItemBody {
-    id: String,
-    title: String,
-    price: Option<f64>,
-    original_price: Option<f64>,
-    status: String,
-    available_quantity: Option<i64>,
-    permalink: String,
-    thumbnail: Option<String>,
-    shipping: Option<Shipping>,
-}
-
-/// Consulta em lote: um resultado por código pedido, **na mesma ordem** do pedido.
-pub fn parse_items(json: &str) -> Result<Vec<Result<ItemInfo, String>>, String> {
-    let entries: Vec<BatchEntry> =
-        serde_json::from_str(json).map_err(|e| format!("Resposta inesperada do Mercado Livre: {e}"))?;
-    Ok(entries
-        .into_iter()
-        .map(|e| match e.code {
-            200 => serde_json::from_value::<ItemBody>(e.body)
-                .map(item_info)
-                .map_err(|err| format!("Resposta inesperada do anúncio: {err}")),
-            404 => Err("Anúncio não encontrado no Mercado Livre".into()),
-            c => Err(format!("O Mercado Livre respondeu {c} para este anúncio")),
-        })
-        .collect())
-}
-
-fn item_info(b: ItemBody) -> ItemInfo {
-    let price = b.price.map(to_cents);
-    let ship = b.shipping.unwrap_or_default();
-    let in_stock = b.status == "active" && b.available_quantity.map_or(true, |q| q > 0);
-    ItemInfo {
-        code: b.id,
-        title: b.title,
-        url: b.permalink,
-        image: https(b.thumbnail),
-        reading: Reading {
-            price,
-            list_price: price.and_then(|p| list_price(p, b.original_price)),
-            in_stock,
-            free_shipping: ship.free_shipping,
-        },
+/// O que gravar no histórico: a melhor oferta, ou "sem estoque" quando ninguém vende.
+pub fn reading(best: Option<&BestOffer>) -> Reading {
+    match best {
+        Some(b) => Reading { price: Some(b.price), list_price: b.list_price, in_stock: true, free_shipping: b.free_shipping },
+        None => Reading { price: None, list_price: None, in_stock: false, free_shipping: false },
     }
 }
 
-/// Preço de venda real, com promoções (`/items/{id}/sale_price`): (preço, preço "de").
-pub fn parse_sale_price(json: &str) -> Option<(i64, Option<i64>)> {
-    #[derive(Deserialize)]
-    struct Sale {
-        amount: Option<f64>,
-        regular_amount: Option<f64>,
+pub fn offer(p: CatalogProduct, b: BestOffer) -> Offer {
+    Offer {
+        store: STORE.into(),
+        url: product_url(&p.id),
+        code: p.id,
+        title: p.name,
+        image: p.image,
+        price: b.price,
+        list_price: b.list_price,
+        free_shipping: b.free_shipping,
+        full: b.full,
+        sellers: b.sellers,
     }
-    let s: Sale = serde_json::from_str(json).ok()?;
-    let price = to_cents(s.amount?);
-    Some((price, list_price(price, s.regular_amount)))
-}
-
-/// Anúncio que está vendendo numa página de catálogo (`/products/{id}`).
-pub fn parse_buy_box_winner(json: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Winner {
-        item_id: String,
-    }
-    #[derive(Deserialize)]
-    struct Product {
-        buy_box_winner: Option<Winner>,
-    }
-    serde_json::from_str::<Product>(json).ok()?.buy_box_winner.map(|w| w.item_id)
 }
 
 pub fn parse_nickname(json: &str) -> Option<String> {
@@ -204,10 +189,10 @@ pub fn parse_nickname(json: &str) -> Option<String> {
 
 #[derive(Debug, PartialEq)]
 pub enum LinkRef {
-    /// Anúncio (MLB + dígitos), consultado direto.
-    Item(String),
-    /// Página de catálogo (`/p/MLB…`): é preciso descobrir qual anúncio está vendendo.
+    /// Página de catálogo (`/p/MLB…`): é o que o app acompanha.
     Catalog(String),
+    /// Anúncio avulso (MLB + dígitos). A API não deixa consultar.
+    Item(String),
 }
 
 /// Dígitos logo depois de `pat` (ignorando um hífen), se forem pelo menos 6.
@@ -225,15 +210,9 @@ fn digits_after(s: &str, pat: &str) -> Option<String> {
     None
 }
 
-/// Reconhece o que o usuário colou: link de anúncio, de catálogo ou só o código.
+/// Reconhece o que o usuário colou. O catálogo tem prioridade, mesmo quando o link aponta um anúncio dele.
 pub fn parse_link(input: &str) -> Option<LinkRef> {
     let s = input.trim().to_uppercase();
-    // Catálogo com o anúncio escolhido: ...#wid=MLB123 ou ...item_id:MLB123
-    for pat in ["WID=MLB", "ITEM_ID:MLB", "ITEM_ID%3AMLB"] {
-        if let Some(d) = digits_after(&s, pat) {
-            return Some(LinkRef::Item(format!("MLB{d}")));
-        }
-    }
     if let Some(d) = digits_after(&s, "/P/MLB") {
         return Some(LinkRef::Catalog(format!("MLB{d}")));
     }
@@ -291,49 +270,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn le_a_busca() {
-        let offers = parse_search(include_str!("../tests/fixtures/ml/search.json")).unwrap();
-        assert_eq!(offers.len(), 2, "anúncio sem preço fica de fora");
-        let a = &offers[0];
-        assert_eq!((a.code.as_str(), a.price, a.list_price), ("MLB3456789012", 38990, Some(49990)));
-        assert!(a.free_shipping && a.full);
-        assert_eq!(a.image.as_deref(), Some("https://http2.mlstatic.com/D_123456-MLA0000000000_012024-I.jpg"));
-        assert_eq!(a.seller.as_deref(), Some("KINGSTON OFICIAL"));
-        let b = &offers[1];
-        assert_eq!((b.price, b.list_price, b.free_shipping, b.full, b.seller.clone()), (35900, None, false, false, None));
+    fn le_a_busca_no_catalogo() {
+        let found = parse_catalog_search(include_str!("../tests/fixtures/ml/catalog-search.json")).unwrap();
+        assert_eq!(found.len(), 10);
+        assert_eq!(found[0].id, "MLB29752372");
+        assert!(found[0].name.starts_with("Dell Inspiron"));
+        assert_eq!(found[0].image.as_deref(), Some("https://http2.mlstatic.com/D_NQ_NP_641549-MLU73999134188_012024-F.jpg"));
     }
 
     #[test]
-    fn le_a_consulta_em_lote() {
-        let items = parse_items(include_str!("../tests/fixtures/ml/items.json")).unwrap();
-        assert_eq!(items.len(), 3);
-        let a = items[0].as_ref().unwrap();
-        assert_eq!(a.reading, Reading { price: Some(37990), list_price: Some(49990), in_stock: true, free_shipping: true });
-        assert_eq!(a.image.as_deref(), Some("https://http2.mlstatic.com/D_1.jpg"));
-        let b = items[1].as_ref().unwrap();
-        assert!(!b.reading.in_stock, "anúncio pausado conta como sem estoque");
-        assert_eq!(items[2].as_ref().unwrap_err(), "Anúncio não encontrado no Mercado Livre");
+    fn le_o_produto() {
+        let p = parse_product(include_str!("../tests/fixtures/ml/product.json")).unwrap();
+        assert_eq!(p.id, "MLB39766120");
+        assert_eq!(p.name, "SSD Kingston NV3 1TB M.2 2280 PCIe 4.0 NVMe 6000 MB/s");
+        assert!(p.image.unwrap().starts_with("https://http2.mlstatic.com/"));
     }
 
     #[test]
-    fn le_o_preco_de_venda_e_o_catalogo() {
-        assert_eq!(parse_sale_price(include_str!("../tests/fixtures/ml/sale_price.json")), Some((36990, Some(49990))));
-        assert_eq!(parse_sale_price(include_str!("../tests/fixtures/ml/sale_price_sem_promo.json")), Some((35900, None)));
-        assert_eq!(parse_sale_price("{}"), None);
-        assert_eq!(parse_buy_box_winner(include_str!("../tests/fixtures/ml/product.json")).as_deref(), Some("MLB3456789012"));
-        assert_eq!(parse_buy_box_winner(r#"{"id":"MLB1","buy_box_winner":null}"#), None);
-        assert_eq!(parse_nickname(r#"{"id":1,"nickname":"JEANK"}"#).as_deref(), Some("JEANK"));
+    fn pega_a_oferta_nova_mais_barata() {
+        let best = parse_product_items(include_str!("../tests/fixtures/ml/product-items.json")).unwrap();
+        assert_eq!(best, BestOffer { price: 99700, list_price: Some(144900), free_shipping: true, full: false, sellers: 198 });
+        assert_eq!(reading(Some(&best)), Reading { price: Some(99700), list_price: Some(144900), in_stock: true, free_shipping: true });
+        assert_eq!(reading(None).in_stock, false);
+    }
+
+    #[test]
+    fn ignora_usados_e_lista_vazia() {
+        let json = r#"{"paging":{"total":2},"results":[
+            {"price":50,"condition":"used","shipping":{"free_shipping":true}},
+            {"price":80,"original_price":70,"condition":"new","shipping":{"free_shipping":false,"logistic_type":"fulfillment"}}]}"#;
+        assert_eq!(parse_product_items(json), Some(BestOffer { price: 8000, list_price: None, free_shipping: false, full: true, sellers: 2 }));
+        assert_eq!(parse_product_items(r#"{"paging":{"total":1},"results":[{"price":50,"condition":"used"}]}"#), None);
+        assert_eq!(parse_product_items(r#"{"paging":{"total":0},"results":[]}"#), None);
+    }
+
+    #[test]
+    fn monta_a_oferta_do_produto() {
+        let p = CatalogProduct { id: "MLB39766120".into(), name: "SSD".into(), image: None };
+        let o = offer(p, BestOffer { price: 99700, list_price: None, free_shipping: true, full: false, sellers: 3 });
+        assert_eq!((o.code.as_str(), o.url.as_str(), o.sellers), ("MLB39766120", "https://www.mercadolivre.com.br/p/MLB39766120", 3));
     }
 
     #[test]
     fn reconhece_links_do_mercado_livre() {
         use LinkRef::*;
-        let item = || Some(Item("MLB3456789012".into()));
-        assert_eq!(parse_link("https://produto.mercadolivre.com.br/MLB-3456789012-ssd-kingston-_JM"), item());
-        assert_eq!(parse_link("https://www.mercadolivre.com.br/ssd/p/MLB19698968#wid=MLB3456789012&sid=search"), item());
-        assert_eq!(parse_link("https://www.mercadolivre.com.br/ssd/p/MLB19698968?pdp_filters=item_id:MLB3456789012"), item());
-        assert_eq!(parse_link("  mlb3456789012 "), item());
-        assert_eq!(parse_link("https://www.mercadolivre.com.br/ssd-kingston/p/MLB19698968"), Some(Catalog("MLB19698968".into())));
+        let catalog = || Some(Catalog("MLB19698968".into()));
+        assert_eq!(parse_link("https://www.mercadolivre.com.br/ssd-kingston/p/MLB19698968"), catalog());
+        assert_eq!(parse_link("https://www.mercadolivre.com.br/ssd/p/MLB19698968#wid=MLB3456789012&sid=search"), catalog());
+        assert_eq!(parse_link("https://produto.mercadolivre.com.br/MLB-3456789012-ssd-kingston-_JM"), Some(Item("MLB3456789012".into())));
+        assert_eq!(parse_link("  mlb3456789012 "), Some(Item("MLB3456789012".into())));
         assert_eq!(parse_link("https://www.amazon.com.br/dp/B0ABCDEFGH"), None);
+        assert_eq!(parse_nickname(r#"{"id":1,"nickname":"JEANK"}"#).as_deref(), Some("JEANK"));
     }
 }

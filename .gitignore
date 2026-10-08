@@ -2,3 +2,7 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+
+# Saídas do "Diagnóstico da API" (modo de desenvolvimento)
+src-tauri/tests/fixtures/ml/probe.txt
+src-tauri/tests/fixtures/ml/real-*.json

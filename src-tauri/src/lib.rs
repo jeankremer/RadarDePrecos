@@ -94,6 +94,14 @@ fn save_config(app: &AppHandle, config: &Config) -> CmdResult<()> {
     fs::write(data_dir(app)?.join("config.json"), json).map_err(|e| format!("Não foi possível salvar as configurações: {e}"))
 }
 
+fn now() -> String {
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+fn today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -128,16 +136,26 @@ async fn ensure_token(state: &AppState, cfg: &Config) -> CmdResult<String> {
 }
 
 /// GET na API do ML. Se o token for recusado (401), renova uma vez e tenta de novo.
-async fn ml_get(app: &AppHandle, state: &AppState, path: &str, query: &[(&str, &str)]) -> CmdResult<String> {
+async fn ml_get(app: &AppHandle, state: &AppState, path: &str, query: &[(&str, &str)]) -> Result<String, ml::ApiError> {
     let cfg = load_config(app);
     for attempt in 0..2 {
-        let token = ensure_token(state, &cfg).await?;
+        let token = ensure_token(state, &cfg).await.map_err(ml::ApiError::Other)?;
         match ml::get(&state.http, &token, path, query).await {
             Err(ml::ApiError::Unauthorized) if attempt == 0 => state.ml.lock().await.access_token = None,
-            r => return r.map_err(err),
+            r => return r,
         }
     }
-    Err(ml::ApiError::Unauthorized.to_string())
+    Err(ml::ApiError::Unauthorized)
+}
+
+/// Melhor oferta nova de um produto do catálogo. `Ok(None)` quando ninguém vende (a API responde 404).
+async fn product_offers(app: &AppHandle, id: &str) -> Result<Option<ml::BestOffer>, ml::ApiError> {
+    let state = app.state::<AppState>();
+    match ml_get(app, &state, &format!("/products/{id}/items"), &[("limit", "20")]).await {
+        Ok(body) => Ok(ml::parse_product_items(&body)),
+        Err(ml::ApiError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------- comandos: conta do Mercado Livre ----------
@@ -334,7 +352,7 @@ async fn ml_dump_fixtures(app: AppHandle, state: State<'_, AppState>, query: Str
         }
     }
     if let Some(i) = &item_id {
-        probe("anúncios em lote", "/items", &[("ids", i.as_str()), ("attributes", ml::ITEM_ATTRS)], Some("real-items.json")).await;
+        probe("anúncios em lote", "/items", &[("ids", i.as_str()), ("attributes", "id,title,price,status")], Some("real-items.json")).await;
         probe("anúncio", &format!("/items/{i}"), &[], Some("real-item.json")).await;
         probe("preço de venda", &format!("/items/{i}/sale_price"), &[("context", "channel_marketplace")], Some("real-sale-price.json")).await;
         probe("preços do anúncio", &format!("/items/{i}/prices"), &[], Some("real-item-prices.json")).await;
@@ -347,17 +365,179 @@ async fn ml_dump_fixtures(app: AppHandle, state: State<'_, AppState>, query: Str
     Ok(format!("Diagnóstico salvo: {ok} de {total} endereços OK. Avise o Claude."))
 }
 
-// ---------- comandos: busca ----------
+// ---------- comandos: busca e acompanhamento ----------
 
+/// Produtos do catálogo consultados por busca (cada um custa uma chamada de ofertas, feitas em paralelo).
+const SEARCH_LIMIT: &str = "20";
+
+/// Busca no catálogo e traz a melhor oferta de cada produto. Produtos sem oferta ficam de fora.
 #[tauri::command]
 async fn search(app: AppHandle, state: State<'_, AppState>, query: String) -> CmdResult<Vec<ml::Offer>> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let body = ml_get(&app, &state, &format!("/sites/{}/search", ml::SITE), &[("q", q), ("limit", "50")]).await?;
-    ml::parse_search(&body)
+    let body = ml_get(&app, &state, "/products/search", &[("status", "active"), ("site_id", ml::SITE), ("q", q), ("limit", SEARCH_LIMIT)])
+        .await
+        .map_err(err)?;
+    let tasks: Vec<_> = ml::parse_catalog_search(&body)?
+        .into_iter()
+        .map(|p| {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let best = product_offers(&app, &p.id).await;
+                (p, best)
+            })
+        })
+        .collect();
+    let mut offers = Vec::new();
+    let mut first_error = None;
+    for task in tasks {
+        match task.await {
+            Ok((p, Ok(Some(best)))) => offers.push(ml::offer(p, best)),
+            Ok((_, Ok(None))) => {}
+            Ok((_, Err(e))) => first_error = first_error.or(Some(e.to_string())),
+            Err(e) => first_error = first_error.or(Some(e.to_string())),
+        }
+    }
+    // Se tudo falhou (sem conexão, acesso expirado), mostra o motivo em vez de "nada encontrado".
+    match first_error {
+        Some(e) if offers.is_empty() => Err(e),
+        _ => Ok(offers),
+    }
 }
+
+/// Para onde vai o link acompanhado: um produto existente ou um novo
+/// (sem nome, o produto novo usa o nome do catálogo).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackTarget {
+    product_id: Option<i64>,
+    new_name: Option<String>,
+}
+
+/// Cria o produto (se preciso), o link e o primeiro ponto do histórico numa transação só.
+fn insert_tracked(state: &AppState, target: &TrackTarget, link: &db::NewLink, reading: &prices::Reading) -> CmdResult<i64> {
+    let mut conn = lock(&state.db);
+    let tx = conn.transaction().map_err(err)?;
+    let now = now();
+    let product_id = match target.product_id {
+        Some(id) => id,
+        None => {
+            let name = target.new_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(link.title);
+            db::add_product(&tx, name, &now).map_err(err)?
+        }
+    };
+    let link_id = db::add_link(&tx, product_id, link)?;
+    db::record_reading(&tx, link_id, reading, &now).map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(product_id)
+}
+
+#[tauri::command]
+async fn track(app: AppHandle, state: State<'_, AppState>, offer: ml::Offer, target: TrackTarget) -> CmdResult<i64> {
+    let reading = prices::Reading { price: Some(offer.price), list_price: offer.list_price, in_stock: true, free_shipping: offer.free_shipping };
+    let link = db::NewLink { store: &offer.store, code: &offer.code, url: &offer.url, title: &offer.title, image: offer.image.as_deref() };
+    let id = insert_tracked(&state, &target, &link, &reading)?;
+    after_change(&app, &state);
+    Ok(id)
+}
+
+#[tauri::command]
+async fn track_url(app: AppHandle, state: State<'_, AppState>, url: String, target: TrackTarget) -> CmdResult<i64> {
+    let id = match ml::parse_link(&url).ok_or("Cole um link do Mercado Livre")? {
+        ml::LinkRef::Catalog(id) => id,
+        ml::LinkRef::Item(_) => {
+            return Err("Esse é o link de um anúncio avulso, que o Mercado Livre não deixa consultar. \
+                Use o link do produto (com /p/MLB… no endereço) ou encontre o produto em Buscar."
+                .into())
+        }
+    };
+    let body = ml_get(&app, &state, &format!("/products/{id}"), &[]).await.map_err(|e| match e {
+        ml::ApiError::NotFound => "Produto não encontrado no catálogo do Mercado Livre".to_string(),
+        e => e.to_string(),
+    })?;
+    let product = ml::parse_product(&body).ok_or("Resposta inesperada do Mercado Livre")?;
+    let best = product_offers(&app, &id).await.map_err(err)?;
+    let url = ml::product_url(&id);
+    let link = db::NewLink { store: ml::STORE, code: &id, url: &url, title: &product.name, image: product.image.as_deref() };
+    let product_id = insert_tracked(&state, &target, &link, &ml::reading(best.as_ref()))?;
+    after_change(&app, &state);
+    Ok(product_id)
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CheckSummary {
+    checked: usize,
+    changed: usize,
+    failed: usize,
+}
+
+/// Consulta a melhor oferta de cada produto acompanhado e grava o que mudou.
+#[tauri::command]
+async fn check_now(app: AppHandle, state: State<'_, AppState>) -> CmdResult<CheckSummary> {
+    let links = db::links_to_check(&lock(&state.db), ml::STORE).map_err(err)?;
+    let mut sum = CheckSummary::default();
+    for (link_id, code) in &links {
+        let result = product_offers(&app, code).await;
+        let conn = lock(&state.db);
+        match result {
+            Ok(best) => {
+                if db::record_reading(&conn, *link_id, &ml::reading(best.as_ref()), &now()).map_err(err)? {
+                    sum.changed += 1;
+                }
+                sum.checked += 1;
+            }
+            Err(e) => {
+                db::record_failure(&conn, *link_id, &e.to_string(), &now()).map_err(err)?;
+                sum.failed += 1;
+            }
+        }
+    }
+    after_change(&app, &state);
+    Ok(sum)
+}
+
+#[tauri::command]
+fn list_products(state: State<'_, AppState>) -> CmdResult<Vec<db::ProductSummary>> {
+    db::list_products(&lock(&state.db), &today()).map_err(err)
+}
+
+#[tauri::command]
+fn product_detail(state: State<'_, AppState>, id: i64) -> CmdResult<db::ProductDetail> {
+    db::product_detail(&lock(&state.db), id, &today()).map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => "Produto não encontrado".to_string(),
+        e => e.to_string(),
+    })
+}
+
+#[tauri::command]
+fn rename_product(app: AppHandle, state: State<'_, AppState>, id: i64, name: String) -> CmdResult<()> {
+    if name.trim().is_empty() {
+        return Err("O nome não pode ficar vazio".into());
+    }
+    db::rename_product(&lock(&state.db), id, &name).map_err(err)?;
+    after_change(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_product(app: AppHandle, state: State<'_, AppState>, id: i64) -> CmdResult<()> {
+    db::delete_product(&lock(&state.db), id).map_err(err)?;
+    after_change(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_link(app: AppHandle, state: State<'_, AppState>, id: i64) -> CmdResult<()> {
+    db::delete_link(&lock(&state.db), id).map_err(err)?;
+    after_change(&app, &state);
+    Ok(())
+}
+
+/// Chamado depois de cada mudança nos dados. A Tarefa 12 põe o backup aqui.
+fn after_change(_app: &AppHandle, _state: &AppState) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -384,7 +564,15 @@ pub fn run() {
             ml_connect,
             ml_disconnect,
             ml_dump_fixtures,
-            search
+            search,
+            track,
+            track_url,
+            check_now,
+            list_products,
+            product_detail,
+            rename_product,
+            delete_product,
+            delete_link
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar o aplicativo");

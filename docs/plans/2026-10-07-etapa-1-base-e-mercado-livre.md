@@ -28,6 +28,28 @@ Shopee. Ficam para as etapas 2 a 4 do [desenho](2026-10-07-radar-de-precos-desig
 | App no DevCenter: **Radar Ofertas JEV**, Client ID `417769415941125` | O Client ID é público e vai como padrão no código. A chave secreta **nunca** entra no código, no chat ou no git |
 | **Ainda não confirmado:** se `/sites/MLB/search` responde com o token do usuário | **Tarefa 8 é um ponto de decisão.** Se a busca der 403 mesmo conectado, parar e rever a busca antes da Tarefa 9 |
 
+## Mudança decidida na Tarefa 8 (07/10/2026)
+
+O diagnóstico com o login real mostrou o que a API libera para o app "Radar Ofertas JEV" (não certificado):
+
+| Endereço | Resultado |
+|---|---|
+| `/sites/MLB/search` (anúncios por texto ou categoria) | 403 |
+| `/items?ids=`, `/items/{id}`, `/items/{id}/sale_price`, `/items/{id}/prices` | 403 |
+| `/products/search?site_id=MLB&status=active&q=` (catálogo) | OK, mas sem preço |
+| `/products/{id}` (nome, fotos) | OK |
+| `/products/{id}/items` (todas as ofertas do produto, já do menor preço para o maior) | OK; 404 quando não há vendedor |
+| `/highlights/MLB/category/{cat}` (mais vendidos) | OK |
+
+**Decisão (opção C):** no Mercado Livre o app trabalha com **produtos do catálogo**, não com anúncios.
+- **Buscar:** `/products/search` e depois `/products/{id}/items` de cada resultado, em paralelo. A tela mostra o menor preço entre as ofertas **novas** e quantos vendedores o produto tem. Produtos sem oferta ficam de fora.
+- **Acompanhar e Checar agora:** o link guarda o id do produto (`MLB39766120`) e a URL `https://www.mercadolivre.com.br/p/{id}`. A leitura é a menor oferta nova; 404 conta como "sem estoque", não como falha.
+- **Adicionar por link:** só links de catálogo (`…/p/MLB…`). Para link de anúncio, o app explica o motivo.
+- Saem `parse_items`, `parse_sale_price`, `parse_buy_box_winner`, `ITEM_ATTRS` e `BATCH`. As fixtures escritas à mão dão lugar às respostas reais.
+- **Depois:** anúncios fora do catálogo pelo navegador escondido, na etapa da Shopee.
+
+As Tarefas 9 a 11 abaixo seguem valendo na estrutura. O que muda é o que está nesta seção.
+
 ## Convenções (iguais às do Cofre)
 
 - Identificadores do código em inglês. Textos da interface, mensagens de erro, comentários e nomes de testes em português.
