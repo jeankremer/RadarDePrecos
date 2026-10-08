@@ -51,7 +51,7 @@ function mlActions(ml) {
   if (ml.connected) {
     return `<button id="mltest"><i class="ti ti-plug-connected"></i> Testar</button>
       <button class="ghost danger" id="mloff">Desconectar</button>
-      ${import.meta.env.DEV ? '<button class="ghost" id="mldump" title="Salva respostas reais em src-tauri/tests/fixtures/ml">Salvar respostas para testes</button>' : ''}`;
+      ${import.meta.env.DEV ? '<button class="ghost" id="mldump" title="Testa vários endereços da API e salva as respostas em src-tauri/tests/fixtures/ml">Diagnóstico da API</button>' : ''}`;
   }
   if (waitingLogin) return '<button id="mlcancel">Cancelar</button>';
   return `<button class="primary" id="mlconnect" ${ml.hasSecret ? '' : 'disabled title="Salve a chave secreta primeiro"'}>

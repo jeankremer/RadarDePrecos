@@ -1,0 +1,2 @@
+# Respostas salvas pelo diagnóstico não devem reiniciar o app no tauri dev.
+tests/

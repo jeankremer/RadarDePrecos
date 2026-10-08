@@ -199,8 +199,9 @@ async fn ml_save_settings(
 }
 
 /// Abre a janela de login do ML. O resultado chega à interface pelo evento `ml-login`.
+/// Precisa ser `async`: no Windows, criar janela num comando síncrono trava (a janela fica em branco).
 #[tauri::command]
-fn ml_connect(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+async fn ml_connect(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let cfg = load_config(&app);
     if secrets::get(secrets::ML_SECRET)?.is_none() {
         return Err("Salve a chave secreta antes de conectar".into());
@@ -278,23 +279,72 @@ async fn ml_disconnect(app: AppHandle, state: State<'_, AppState>) -> CmdResult<
     ml_status(app)
 }
 
-/// Só em desenvolvimento: salva respostas reais em `src-tauri/tests/fixtures/ml` para os testes.
-/// Busca e anúncios são dados públicos; `/users/me` (dados pessoais) nunca é salvo.
+/// Só em desenvolvimento: testa vários endereços da API com o acesso atual e salva as respostas em
+/// `src-tauri/tests/fixtures/ml` (resumo em `probe.txt`). Só dados públicos de catálogo e anúncios:
+/// `/users/me` aparece só com o status, sem o corpo.
 #[tauri::command]
 async fn ml_dump_fixtures(app: AppHandle, state: State<'_, AppState>, query: String) -> CmdResult<String> {
     if !cfg!(debug_assertions) {
         return Err("Disponível só em desenvolvimento".into());
     }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("ml");
-    let save = |name: &str, body: &str| fs::write(dir.join(name), body).map_err(err);
-    let search = ml_get(&app, &state, &format!("/sites/{}/search", ml::SITE), &[("q", query.as_str()), ("limit", "5")]).await?;
-    save("real-search.json", &search)?;
-    let first = ml::parse_search(&search)?.into_iter().next().ok_or("A busca não trouxe resultados")?;
-    let items = ml_get(&app, &state, "/items", &[("ids", first.code.as_str()), ("attributes", ml::ITEM_ATTRS)]).await?;
-    save("real-items.json", &items)?;
-    let sale = ml_get(&app, &state, &format!("/items/{}/sale_price", first.code), &[("context", "channel_marketplace")]).await?;
-    save("real-sale-price.json", &sale)?;
-    Ok(format!("Respostas salvas em {}", dir.display()))
+    let mut report = Vec::new();
+    // Faz a chamada, anota OK/erro no resumo e salva o corpo quando `file` é informado.
+    let mut probe = async |name: &str, path: &str, query: &[(&str, &str)], file: Option<&str>| -> Option<serde_json::Value> {
+        match ml_get(&app, &state, path, query).await {
+            Ok(body) => {
+                report.push(format!("OK    {name}: {path} {query:?}"));
+                if let Some(f) = file {
+                    let _ = fs::write(dir.join(f), &body);
+                }
+                serde_json::from_str(&body).ok()
+            }
+            Err(e) => {
+                report.push(format!("ERRO  {name}: {path} {query:?}\n      {e}"));
+                None
+            }
+        }
+    };
+    let q = query.as_str();
+    probe("busca de anúncios", "/sites/MLB/search", &[("q", q), ("limit", "5")], Some("real-search.json")).await;
+    let products = probe("busca de catálogo", "/products/search", &[("status", "active"), ("site_id", "MLB"), ("q", q), ("limit", "10")], Some("real-products-search.json")).await;
+    let highlights = probe("mais vendidos da categoria", "/highlights/MLB/category/MLB1672", &[], Some("real-highlights.json")).await;
+    // Candidatos: mais vendidos primeiro (quase sempre têm vendedor), depois os resultados da busca.
+    let mut candidates: Vec<String> = Vec::new();
+    for v in [&highlights, &products].into_iter().flatten() {
+        let list = v["content"].as_array().or_else(|| v["results"].as_array()).cloned().unwrap_or_default();
+        candidates.extend(list.iter().filter_map(|x| x["id"].as_str().map(String::from)).take(6));
+    }
+    let (mut product_id, mut item_id) = (None, None);
+    for p in &candidates {
+        let prod = probe("produto do catálogo", &format!("/products/{p}"), &[], None).await;
+        let winner = prod.as_ref().and_then(|v| v["buy_box_winner"]["item_id"].as_str()).map(String::from);
+        let items = probe("anúncios do produto", &format!("/products/{p}/items"), &[], None).await;
+        let first = items.as_ref().and_then(|v| v["results"][0]["item_id"].as_str()).map(String::from);
+        if let Some(i) = winner.or(first) {
+            if let Some(v) = &prod {
+                let _ = fs::write(dir.join("real-product.json"), v.to_string());
+            }
+            if let Some(v) = &items {
+                let _ = fs::write(dir.join("real-product-items.json"), v.to_string());
+            }
+            product_id = Some(p.clone());
+            item_id = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = &item_id {
+        probe("anúncios em lote", "/items", &[("ids", i.as_str()), ("attributes", ml::ITEM_ATTRS)], Some("real-items.json")).await;
+        probe("anúncio", &format!("/items/{i}"), &[], Some("real-item.json")).await;
+        probe("preço de venda", &format!("/items/{i}/sale_price"), &[("context", "channel_marketplace")], Some("real-sale-price.json")).await;
+        probe("preços do anúncio", &format!("/items/{i}/prices"), &[], Some("real-item-prices.json")).await;
+    }
+    probe("usuário (só status)", "/users/me", &[], None).await;
+    let ok = report.iter().filter(|l| l.starts_with("OK")).count();
+    let total = report.len();
+    let summary = format!("produto: {product_id:?}\nanúncio: {item_id:?}\n\n{}\n", report.join("\n"));
+    fs::write(dir.join("probe.txt"), &summary).map_err(err)?;
+    Ok(format!("Diagnóstico salvo: {ok} de {total} endereços OK. Avise o Claude."))
 }
 
 // ---------- comandos: busca ----------
