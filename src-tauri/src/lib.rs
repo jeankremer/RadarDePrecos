@@ -1,5 +1,6 @@
 //! Núcleo do Radar de Preços: banco local, Mercado Livre e comandos da interface.
 
+mod alerts;
 mod backup;
 mod db;
 mod ml;
