@@ -2,7 +2,9 @@
 
 mod db;
 mod ml;
+mod ml_auth;
 mod prices;
+mod secrets;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
