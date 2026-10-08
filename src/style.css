@@ -694,3 +694,16 @@ select option { background: var(--surface-solid); color: var(--text); }
   .fluig input { display: none; }
   .ag-row.is-late { box-shadow: none; }
 }
+
+/* ---------- Radar de Preços ---------- */
+.ok-text { color: var(--success); }
+.warn-text { color: var(--warning); }
+.small { font-size: 12px; }
+.ml-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin: 14px 0 8px; align-items: end; }
+.ml-form label { font-size: 12px; color: var(--text-3); display: flex; flex-direction: column; gap: 4px; }
+.ml-form .wide { grid-column: 1 / -1; }
+.ml-form button { justify-self: start; }
+select {
+  font: inherit; color: var(--text); width: 100%; height: 36px; padding: 0 8px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface-solid);
+}
