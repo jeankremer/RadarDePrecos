@@ -5,6 +5,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
+use crate::alerts;
 use crate::prices::{self, PricePoint, Reading};
 
 /// Cada item roda uma vez, em ordem; `user_version` guarda quantos já rodaram.
@@ -41,6 +42,17 @@ CREATE TABLE prices (
   free_shipping INTEGER NOT NULL
 );
 CREATE INDEX prices_link_at ON prices (link_id, at);
+"#, r#"
+CREATE TABLE alerts (
+  id INTEGER PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  price_before INTEGER,
+  price_after INTEGER NOT NULL,
+  at TEXT NOT NULL,
+  read INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX alerts_at ON alerts (at);
 "#];
 
 /// Dias do mini gráfico da lista.
@@ -122,6 +134,40 @@ pub struct ProductSummary {
     /// Melhor preço de cada um dos últimos `SPARK_DAYS` dias.
     pub spark: Vec<Option<i64>>,
     pub last_check: Option<String>,
+    pub min_drop_pct: f64,
+    pub notify_lowest: bool,
+    /// Maior preço da melhor oferta nos últimos 30 dias.
+    pub max_30d: Option<i64>,
+    /// O preço "de" da melhor oferta parece inflado (ver `alerts::inflated`).
+    pub inflated: bool,
+}
+
+/// Linha da tabela de produtos com as regras de alerta.
+struct ProductRow {
+    id: i64,
+    name: String,
+    target_price: Option<i64>,
+    min_drop_pct: f64,
+    notify_lowest: bool,
+}
+
+const PRODUCT_COLS: &str = "id, name, target_price, min_drop_pct, notify_lowest";
+
+fn row_to_product(r: &rusqlite::Row) -> rusqlite::Result<ProductRow> {
+    Ok(ProductRow { id: r.get(0)?, name: r.get(1)?, target_price: r.get(2)?, min_drop_pct: r.get(3)?, notify_lowest: r.get(4)? })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertRow {
+    pub id: i64,
+    pub product_id: i64,
+    pub product_name: String,
+    pub kind: String,
+    pub price_before: Option<i64>,
+    pub price_after: i64,
+    pub at: String,
+    pub read: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,23 +250,93 @@ pub fn record_failure(c: &Connection, link_id: i64, msg: &str, now: &str) -> rus
     Ok(())
 }
 
-/// Links de uma loja em produtos ativos: (id do link, código na loja).
-pub fn links_to_check(c: &Connection, store: &str) -> rusqlite::Result<Vec<(i64, String)>> {
+/// Links de uma loja em produtos ativos, agrupados por produto: (produto, [(link, código na loja)]).
+pub fn products_to_check(c: &Connection, store: &str) -> rusqlite::Result<Vec<(i64, Vec<(i64, String)>)>> {
     let mut stmt = c.prepare(
-        "SELECT l.id, l.code FROM links l JOIN products p ON p.id = l.product_id
-         WHERE l.store = ?1 AND p.archived = 0 ORDER BY l.id",
+        "SELECT l.product_id, l.id, l.code FROM links l JOIN products p ON p.id = l.product_id
+         WHERE l.store = ?1 AND p.archived = 0 ORDER BY l.product_id, l.id",
     )?;
-    let rows = stmt.query_map([store], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let rows = stmt.query_map([store], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?;
+    let mut out: Vec<(i64, Vec<(i64, String)>)> = Vec::new();
+    for row in rows {
+        let (product, link, code) = row?;
+        match out.last_mut() {
+            Some((p, links)) if *p == product => links.push((link, code)),
+            _ => out.push((product, vec![(link, code)])),
+        }
+    }
+    Ok(out)
+}
+
+/// Preço da última leitura do link (None se não houver ou se estava sem oferta).
+pub fn last_price(c: &Connection, link_id: i64) -> rusqlite::Result<Option<i64>> {
+    Ok(last_point(c, link_id)?.filter(|p| p.reading.in_stock).and_then(|p| p.reading.price))
+}
+
+/// Estado e regras do produto antes de uma rodada de checagem: (nome, estado, regras).
+pub fn alert_context(c: &Connection, id: i64, today: &str) -> rusqlite::Result<(String, alerts::Snapshot, alerts::Rules)> {
+    let row = c.query_row(&format!("SELECT {PRODUCT_COLS} FROM products WHERE id = ?1"), [id], row_to_product)?;
+    let rules = alerts::Rules { target: row.target_price, min_drop_pct: row.min_drop_pct, notify_lowest: row.notify_lowest };
+    let (s, hist) = summarize(c, row, today)?;
+    let snapshot = alerts::Snapshot { best: s.best_price, lowest_ever: s.lowest_ever, has_history: hist.iter().any(|h| !h.is_empty()) };
+    Ok((s.name, snapshot, rules))
+}
+
+/// Melhor preço atual do produto (depois da rodada).
+pub fn best_price(c: &Connection, id: i64, today: &str) -> rusqlite::Result<Option<i64>> {
+    let row = c.query_row(&format!("SELECT {PRODUCT_COLS} FROM products WHERE id = ?1"), [id], row_to_product)?;
+    Ok(summarize(c, row, today)?.0.best_price)
+}
+
+pub fn update_rules(c: &Connection, id: i64, target: Option<i64>, min_drop_pct: f64, notify_lowest: bool) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE products SET target_price = ?2, min_drop_pct = ?3, notify_lowest = ?4 WHERE id = ?1",
+        params![id, target, min_drop_pct, notify_lowest],
+    )?;
+    Ok(())
+}
+
+pub fn add_alert(c: &Connection, product_id: i64, kind: alerts::Kind, before: Option<i64>, after: i64, now: &str) -> rusqlite::Result<i64> {
+    let kind = serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+    c.execute(
+        "INSERT INTO alerts (product_id, kind, price_before, price_after, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![product_id, kind, before, after, now],
+    )?;
+    Ok(c.last_insert_rowid())
+}
+
+/// Alertas mais recentes primeiro.
+pub fn list_alerts(c: &Connection, limit: i64) -> rusqlite::Result<Vec<AlertRow>> {
+    let mut stmt = c.prepare(
+        "SELECT a.id, a.product_id, p.name, a.kind, a.price_before, a.price_after, a.at, a.read
+         FROM alerts a JOIN products p ON p.id = a.product_id ORDER BY a.at DESC, a.id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |r| {
+        Ok(AlertRow {
+            id: r.get(0)?,
+            product_id: r.get(1)?,
+            product_name: r.get(2)?,
+            kind: r.get(3)?,
+            price_before: r.get(4)?,
+            price_after: r.get(5)?,
+            at: r.get(6)?,
+            read: r.get(7)?,
+        })
+    })?;
     rows.collect()
 }
 
-fn summarize(
-    c: &Connection,
-    id: i64,
-    name: String,
-    target_price: Option<i64>,
-    today: &str,
-) -> rusqlite::Result<(ProductSummary, Vec<Vec<PricePoint>>)> {
+pub fn unread_alerts(c: &Connection) -> rusqlite::Result<i64> {
+    c.query_row("SELECT count(*) FROM alerts WHERE read = 0", [], |r| r.get(0))
+}
+
+pub fn mark_alerts_read(c: &Connection) -> rusqlite::Result<()> {
+    c.execute("UPDATE alerts SET read = 1 WHERE read = 0", [])?;
+    Ok(())
+}
+
+fn summarize(c: &Connection, row: ProductRow, today: &str) -> rusqlite::Result<(ProductSummary, Vec<Vec<PricePoint>>)> {
+    let ProductRow { id, name, target_price, min_drop_pct, notify_lowest } = row;
     let mut stmt = c.prepare(
         "SELECT id, store, code, url, title, image, last_check, last_error, failures
          FROM links WHERE product_id = ?1 ORDER BY id",
@@ -246,7 +362,21 @@ fn summarize(
         l.current = h.last().map(|p| p.reading.clone());
     }
     let best = prices::current_best(&hist);
+    // Promoção inflada: o "de" da melhor oferta contra o que essa oferta já cobrou nos últimos 30 dias.
+    let (max_30d, inflated) = match best {
+        Some((i, _)) => {
+            let since = prices::last_days(today, 31)[0].clone();
+            let max = prices::max_since(&hist[i], &since);
+            let list = hist[i].last().and_then(|p| p.reading.list_price);
+            (max, alerts::inflated(list, max, prices::days_tracked(&hist[i], today)))
+        }
+        None => (None, false),
+    };
     let summary = ProductSummary {
+        min_drop_pct,
+        notify_lowest,
+        max_30d,
+        inflated,
         id,
         name,
         target_price,
@@ -262,16 +392,14 @@ fn summarize(
 }
 
 pub fn list_products(c: &Connection, today: &str) -> rusqlite::Result<Vec<ProductSummary>> {
-    let mut stmt = c.prepare("SELECT id, name, target_price FROM products WHERE archived = 0 ORDER BY name COLLATE NOCASE")?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(|(id, name, tp)| summarize(c, id, name, tp, today).map(|(s, _)| s)).collect()
+    let mut stmt = c.prepare(&format!("SELECT {PRODUCT_COLS} FROM products WHERE archived = 0 ORDER BY name COLLATE NOCASE"))?;
+    let rows = stmt.query_map([], row_to_product)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|row| summarize(c, row, today).map(|(s, _)| s)).collect()
 }
 
 pub fn product_detail(c: &Connection, id: i64, today: &str) -> rusqlite::Result<ProductDetail> {
-    let (name, tp) = c.query_row("SELECT name, target_price FROM products WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    let (product, hist) = summarize(c, id, name, tp, today)?;
+    let row = c.query_row(&format!("SELECT {PRODUCT_COLS} FROM products WHERE id = ?1"), [id], row_to_product)?;
+    let (product, hist) = summarize(c, row, today)?;
     let history = product
         .links
         .iter()
@@ -367,6 +495,53 @@ mod tests {
 
         delete_link(&c, l).unwrap();
         assert_eq!((count(&c, "products"), count(&c, "prices")), (0, 0), "sem links, o produto some junto com o histórico");
+    }
+
+    #[test]
+    fn regras_alertas_e_agrupamento() {
+        let c = open_in_memory();
+        let p = add_product(&c, "SSD", "2026-10-01T08:00:00").unwrap();
+        let q = add_product(&c, "Air Fryer", "2026-10-01T08:00:00").unwrap();
+        let a = add_link(&c, p, &link("MLB1")).unwrap();
+        let b = add_link(&c, p, &link("MLB2")).unwrap();
+        let x = add_link(&c, q, &link("MLB3")).unwrap();
+        let groups = products_to_check(&c, "ml").unwrap();
+        assert_eq!(groups, vec![(p, vec![(a, "MLB1".into()), (b, "MLB2".into())]), (q, vec![(x, "MLB3".into())])]);
+
+        let (_, snap, rules) = alert_context(&c, p, "2026-10-01").unwrap();
+        assert!(!snap.has_history);
+        assert_eq!((rules.target, rules.min_drop_pct, rules.notify_lowest), (None, 5.0, true));
+        update_rules(&c, p, Some(40000), 10.0, false).unwrap();
+        record_reading(&c, a, &r(45000), "2026-10-01T08:00:00").unwrap();
+        let (name, snap, rules) = alert_context(&c, p, "2026-10-01").unwrap();
+        assert_eq!((name.as_str(), snap.best, snap.has_history), ("SSD", Some(45000), true));
+        assert_eq!((rules.target, rules.min_drop_pct, rules.notify_lowest), (Some(40000), 10.0, false));
+        assert_eq!(last_price(&c, a).unwrap(), Some(45000));
+        assert_eq!(last_price(&c, b).unwrap(), None);
+
+        add_alert(&c, p, alerts::Kind::Drop, Some(50000), 45000, "2026-10-01T09:00:00").unwrap();
+        add_alert(&c, q, alerts::Kind::BackInStock, None, 30000, "2026-10-01T10:00:00").unwrap();
+        assert_eq!(unread_alerts(&c).unwrap(), 2);
+        let list = list_alerts(&c, 10).unwrap();
+        assert_eq!((list[0].product_name.as_str(), list[0].kind.as_str()), ("Air Fryer", "back_in_stock"));
+        assert_eq!((list[1].kind.as_str(), list[1].price_before, list[1].read), ("drop", Some(50000), false));
+        mark_alerts_read(&c).unwrap();
+        assert_eq!(unread_alerts(&c).unwrap(), 0);
+        delete_product(&c, q).unwrap();
+        assert_eq!(list_alerts(&c, 10).unwrap().len(), 1, "alertas saem junto com o produto");
+    }
+
+    #[test]
+    fn detecta_promocao_inflada() {
+        let c = open_in_memory();
+        let p = add_product(&c, "SSD", "2026-09-20T08:00:00").unwrap();
+        let l = add_link(&c, p, &link("MLB1")).unwrap();
+        record_reading(&c, l, &r(50000), "2026-09-20T08:00:00").unwrap();
+        record_reading(&c, l, &Reading { list_price: Some(79900), ..r(49900) }, "2026-10-01T08:00:00").unwrap();
+        let s = &list_products(&c, "2026-10-01").unwrap()[0];
+        assert_eq!((s.max_30d, s.inflated), (Some(50000), true), "de R$ 799 nunca foi cobrado");
+        record_reading(&c, l, &Reading { list_price: Some(52000), ..r(49900) }, "2026-10-01T09:00:00").unwrap();
+        assert!(!list_products(&c, "2026-10-01").unwrap()[0].inflated, "4% acima é tolerado");
     }
 
     #[test]

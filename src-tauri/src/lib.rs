@@ -2,6 +2,7 @@
 
 mod alerts;
 mod backup;
+mod checker;
 mod db;
 mod ml;
 mod ml_auth;
@@ -11,14 +12,23 @@ mod secrets;
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        Mutex, MutexGuard,
+    },
     time::Duration,
 };
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_notification::NotificationExt;
 
 const DB_FILE: &str = "radar.db";
 const ML_LOGIN_WINDOW: &str = "ml-login";
@@ -50,6 +60,12 @@ struct AppState {
     /// Mutex assíncrono: duas renovações ao mesmo tempo gastariam o refresh token (uso único).
     ml: tauri::async_runtime::Mutex<MlSession>,
     pending_login: Mutex<Option<PendingLogin>>,
+    /// Uma checagem por vez (manual ou automática).
+    checking: AtomicBool,
+    /// Preços suspeitos esperando a segunda leitura, por link.
+    pending: Mutex<checker::Pending>,
+    /// Quantas rodadas automáticas seguidas falharam inteiras (dobra o intervalo).
+    backoff: AtomicU32,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -70,6 +86,11 @@ struct Config {
     ml_client_id: String,
     ml_redirect_uri: String,
     ml_nickname: Option<String>,
+    /// 0 desliga a checagem automática.
+    check_interval_hours: u32,
+    notify: bool,
+    last_auto_check: Option<String>,
+    tray_hint_shown: bool,
 }
 
 impl Default for Config {
@@ -79,6 +100,10 @@ impl Default for Config {
             ml_client_id: DEFAULT_ML_CLIENT_ID.into(),
             ml_redirect_uri: DEFAULT_ML_REDIRECT.into(),
             ml_nickname: None,
+            check_interval_hours: 3,
+            notify: true,
+            last_auto_check: None,
+            tray_hint_shown: false,
         }
     }
 }
@@ -468,37 +493,168 @@ async fn track_url(app: AppHandle, state: State<'_, AppState>, url: String, targ
     Ok(product_id)
 }
 
-#[derive(Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct CheckSummary {
-    checked: usize,
-    changed: usize,
-    failed: usize,
+/// Consulta a melhor oferta de cada produto acompanhado, grava o que mudou e gera os alertas.
+#[tauri::command]
+async fn check_now(app: AppHandle) -> CmdResult<checker::CheckSummary> {
+    checker::run_check(&app, false, None).await
 }
 
-/// Consulta a melhor oferta de cada produto acompanhado e grava o que mudou.
 #[tauri::command]
-async fn check_now(app: AppHandle, state: State<'_, AppState>) -> CmdResult<CheckSummary> {
-    let links = db::links_to_check(&lock(&state.db), ml::STORE).map_err(err)?;
-    let mut sum = CheckSummary::default();
-    for (link_id, code) in &links {
-        let result = product_offers(&app, code).await;
-        let conn = lock(&state.db);
-        match result {
-            Ok(best) => {
-                if db::record_reading(&conn, *link_id, &ml::reading(best.as_ref()), &now()).map_err(err)? {
-                    sum.changed += 1;
-                }
-                sum.checked += 1;
+fn update_rules(state: State<'_, AppState>, id: i64, target: Option<i64>, min_drop_pct: f64, notify_lowest: bool) -> CmdResult<()> {
+    if !(0.0..=90.0).contains(&min_drop_pct) {
+        return Err("A queda mínima vai de 0% a 90%".into());
+    }
+    if target.is_some_and(|t| t <= 0) {
+        return Err("O preço-alvo precisa ser maior que zero".into());
+    }
+    db::update_rules(&lock(&state.db), id, target, min_drop_pct, notify_lowest).map_err(err)
+}
+
+// ---------- comandos: alertas ----------
+
+#[tauri::command]
+fn list_alerts(state: State<'_, AppState>) -> CmdResult<Vec<db::AlertRow>> {
+    db::list_alerts(&lock(&state.db), 300).map_err(err)
+}
+
+#[tauri::command]
+fn unread_alerts(state: State<'_, AppState>) -> CmdResult<i64> {
+    db::unread_alerts(&lock(&state.db)).map_err(err)
+}
+
+#[tauri::command]
+fn mark_alerts_read(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    db::mark_alerts_read(&lock(&state.db)).map_err(err)?;
+    let _ = app.emit("alerts", 0);
+    Ok(())
+}
+
+// ---------- comandos: checagem automática ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckSettings {
+    interval_hours: u32,
+    notify: bool,
+    autostart: bool,
+    last_auto_check: Option<String>,
+    checking: bool,
+}
+
+#[tauri::command]
+fn check_settings(app: AppHandle, state: State<'_, AppState>) -> CheckSettings {
+    let cfg = load_config(&app);
+    CheckSettings {
+        interval_hours: cfg.check_interval_hours,
+        notify: cfg.notify,
+        autostart: app.autolaunch().is_enabled().unwrap_or(false),
+        last_auto_check: cfg.last_auto_check,
+        checking: state.checking.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
+#[tauri::command]
+fn set_check_settings(app: AppHandle, state: State<'_, AppState>, interval_hours: u32, notify: bool, autostart: bool) -> CmdResult<CheckSettings> {
+    if ![0, 1, 3, 6, 12, 24].contains(&interval_hours) {
+        return Err("Intervalo inválido".into());
+    }
+    let mut cfg = load_config(&app);
+    cfg.check_interval_hours = interval_hours;
+    cfg.notify = notify;
+    save_config(&app, &cfg)?;
+    let launcher = app.autolaunch();
+    if autostart != launcher.is_enabled().unwrap_or(false) {
+        let r = if autostart { launcher.enable() } else { launcher.disable() };
+        r.map_err(|e| format!("Não foi possível mudar o início com o Windows: {e}"))?;
+    }
+    Ok(check_settings(app, state))
+}
+
+/// Notificação de teste, para conferir se o Windows está mostrando.
+#[tauri::command]
+fn test_notification(app: AppHandle) -> CmdResult<()> {
+    app.notification()
+        .builder()
+        .title("Radar de Preços")
+        .body("As notificações estão funcionando.")
+        .show()
+        .map_err(|e| format!("O Windows não mostrou a notificação: {e}"))
+}
+
+// ---------- janela e bandeja ----------
+
+const TRAY_ID: &str = "radar";
+/// Argumento do início com o Windows: abre direto na bandeja.
+const START_MINIMIZED: &str = "--minimized";
+
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+/// Dica da bandeja com a hora da última checagem.
+fn update_tray(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(format!("Radar de Preços\nÚltima checagem às {}", chrono::Local::now().format("%H:%M"))));
+    }
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Abrir o Radar", true, None::<&str>)?;
+    let check = MenuItem::with_id(app, "check", "Checar agora", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &check, &quit])?;
+    let mut tray = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip("Radar de Preços")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main(app),
+            "check" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = checker::run_check(&app, false, None).await;
+                });
             }
-            Err(e) => {
-                db::record_failure(&conn, *link_id, &e.to_string(), &now()).map_err(err)?;
-                sum.failed += 1;
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main(tray.app_handle());
             }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
+/// Fechar a janela principal só esconde: o Radar continua checando na bandeja.
+fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
+    if let WindowEvent::CloseRequested { api, .. } = event {
+        if window.label() != "main" {
+            return;
+        }
+        api.prevent_close();
+        let _ = window.hide();
+        let app = window.app_handle();
+        let mut cfg = load_config(app);
+        if !cfg.tray_hint_shown {
+            cfg.tray_hint_shown = true;
+            let _ = save_config(app, &cfg);
+            let _ = app
+                .notification()
+                .builder()
+                .title("Radar de Preços")
+                .body("O Radar continua rodando perto do relógio. Para fechar de vez, use Sair no ícone.")
+                .show();
         }
     }
-    after_change(&app, &state);
-    Ok(sum)
 }
 
 #[tauri::command]
@@ -594,8 +750,13 @@ fn restore_backup(app: AppHandle, state: State<'_, AppState>, path: String) -> C
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Precisa ser o primeiro plugin: abrir o app de novo mostra a janela que já existe.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![START_MINIMIZED])))
+        .on_window_event(on_window_event)
         .setup(|app| {
             let conn = db::open(&data_dir(app.handle())?.join(DB_FILE))?;
             let http = reqwest::Client::builder()
@@ -607,7 +768,16 @@ pub fn run() {
                 http,
                 ml: Default::default(),
                 pending_login: Mutex::new(None),
+                checking: AtomicBool::new(false),
+                pending: Mutex::new(Default::default()),
+                backoff: AtomicU32::new(0),
             });
+            build_tray(app)?;
+            // A janela começa invisível (tauri.conf.json); só aparece se não veio do início com o Windows.
+            if !std::env::args().any(|a| a == START_MINIMIZED) {
+                show_main(app.handle());
+            }
+            tauri::async_runtime::spawn(checker::scheduler(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -628,7 +798,14 @@ pub fn run() {
             backup_status,
             set_backup_dir,
             backup_now,
-            restore_backup
+            restore_backup,
+            update_rules,
+            list_alerts,
+            unread_alerts,
+            mark_alerts_read,
+            check_settings,
+            set_check_settings,
+            test_notification
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar o aplicativo");

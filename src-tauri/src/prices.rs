@@ -80,9 +80,41 @@ pub fn last_days(today: &str, n: usize) -> Vec<String> {
     (0..n as i64).rev().map(|i| (end - chrono::Duration::days(i)).format("%Y-%m-%d").to_string()).collect()
 }
 
+/// Maior preço com estoque registrado a partir do dia `since` (inclusive).
+pub fn max_since(points: &[PricePoint], since: &str) -> Option<i64> {
+    points
+        .iter()
+        .filter(|p| day(&p.at) >= since && p.reading.in_stock)
+        .filter_map(|p| p.reading.price)
+        .max()
+}
+
+/// Dias desde o primeiro ponto até `today` (0 sem pontos).
+pub fn days_tracked(points: &[PricePoint], today: &str) -> i64 {
+    let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+    match (points.first().and_then(|p| parse(day(&p.at))), parse(today)) {
+        (Some(first), Some(t)) => (t - first).num_days(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maior_preco_e_dias_acompanhados() {
+        let pts = vec![
+            pt("2026-09-01T10:00:00", r(900)),
+            pt("2026-09-20T10:00:00", r(700)),
+            pt("2026-10-01T10:00:00", Reading { in_stock: false, ..r(999) }),
+            pt("2026-10-02T10:00:00", r(650)),
+        ];
+        assert_eq!(max_since(&pts, "2026-09-08"), Some(700));
+        assert_eq!(max_since(&pts, "2026-10-03"), None);
+        assert_eq!(days_tracked(&pts, "2026-10-08"), 37);
+        assert_eq!(days_tracked(&[], "2026-10-08"), 0);
+    }
 
     fn r(price: i64) -> Reading {
         Reading { price: Some(price), list_price: None, in_stock: true, free_shipping: false }
