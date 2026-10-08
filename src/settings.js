@@ -1,15 +1,23 @@
-// Ajustes: conta do Mercado Livre, backup e restauração.
+// Ajustes: conta do Mercado Livre, checagem automática, backup e restauração.
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { open } from '@tauri-apps/plugin-dialog';
 import { esc, toast, setBusy, call } from './core.js';
+import { ago } from './format.js';
+
+const INTERVALS = [[0, 'Desligada'], [1, 'A cada 1 hora'], [3, 'A cada 3 horas'], [6, 'A cada 6 horas'], [12, 'A cada 12 horas'], [24, 'Uma vez por dia']];
 
 let root;
 let waitingLogin = false;
 const $ = (s) => root.querySelector(s);
 
 export const settingsModule = {
+  /** Atualiza "última automática" quando uma checagem termina, sem atrapalhar quem está digitando. */
+  refresh() {
+    if (root?.contains(document.activeElement) && document.activeElement.matches('input, select')) return;
+    load();
+  },
   render(el) {
     root = el;
     root.innerHTML = '<div class="page"><p class="muted">Carregando…</p></div>';
@@ -28,7 +36,7 @@ export const settingsModule = {
 async function load() {
   let data;
   try {
-    data = await Promise.all([invoke('ml_status'), invoke('backup_status'), getVersion().catch(() => '')]);
+    data = await Promise.all([invoke('ml_status'), invoke('check_settings'), invoke('backup_status'), getVersion().catch(() => '')]);
   } catch (e) {
     toast(String(e), 'err');
     return;
@@ -59,7 +67,7 @@ function mlActions(ml) {
     <i class="ti ti-login"></i> Conectar</button>`;
 }
 
-function render(ml, st, version) {
+function render(ml, cs, st, version) {
   root.innerHTML = `
     <div class="page settings">
       <h2 class="pg-title">Ajustes</h2>
@@ -77,6 +85,19 @@ function render(ml, st, version) {
         </form>
         <p class="muted">Dados do app "Radar Ofertas JEV" no DevCenter do Mercado Livre. A chave secreta e o acesso ficam no
           Gerenciador de Credenciais do Windows, fora do banco e dos backups. A URI de redirect precisa ser idêntica à cadastrada.</p>
+      </section>
+
+      <section class="card">
+        <h3><i class="ti ti-clock-play"></i> Checagem automática</h3>
+        <form id="csf" class="check-form">
+          <label>Checar os preços <select id="csint">${INTERVALS.map(([h, t]) => `<option value="${h}" ${h === cs.intervalHours ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+          <label><input type="checkbox" id="csnotify" ${cs.notify ? 'checked' : ''}> Mostrar notificação do Windows</label>
+          <label><input type="checkbox" id="csauto" ${cs.autostart ? 'checked' : ''}> Iniciar com o Windows (perto do relógio)</label>
+        </form>
+        <div class="kv"><span>Última automática</span><b>${cs.lastAutoCheck ? ago(cs.lastAutoCheck) : 'nenhuma ainda'}${cs.checking ? ' · checando agora…' : ''}</b></div>
+        <div class="actions"><button id="cstest"><i class="ti ti-bell-ringing"></i> Testar notificação</button></div>
+        <p class="muted">Fechar a janela não encerra o Radar: ele continua checando perto do relógio. Para fechar de vez,
+          clique com o botão direito no ícone e escolha Sair. A checagem só acontece com o computador ligado.</p>
       </section>
 
       <section class="card">
@@ -117,7 +138,7 @@ function render(ml, st, version) {
         clientSecret: $('#mlsecret').value || null,
       });
       toast('Mercado Livre salvo');
-      render(next, st, version);
+      render(next, cs, st, version);
     } catch {
       setBusy(btn, false);
     }
@@ -126,14 +147,14 @@ function render(ml, st, version) {
     try {
       await call('ml_connect');
       waitingLogin = true;
-      render(ml, st, version);
+      render(ml, cs, st, version);
     } catch { /* call já mostrou o erro */ }
   });
-  $('#mlcancel') && ($('#mlcancel').onclick = () => { waitingLogin = false; render(ml, st, version); });
+  $('#mlcancel') && ($('#mlcancel').onclick = () => { waitingLogin = false; render(ml, cs, st, version); });
   $('#mloff') && ($('#mloff').onclick = async () => {
     if (!confirm('Desconectar a conta do Mercado Livre? Buscas e checagens param até conectar de novo.')) return;
     try {
-      render(await call('ml_disconnect'), st, version);
+      render(await call('ml_disconnect'), cs, st, version);
       toast('Mercado Livre desconectado');
     } catch { /* call já mostrou o erro */ }
   });
@@ -150,12 +171,33 @@ function render(ml, st, version) {
     try { toast(await call('ml_dump_fixtures', { query: 'ssd 1tb' })); } catch { /* call já mostrou o erro */ }
   });
 
+  // ---- checagem automática ----
+  $('#csf').onchange = async () => {
+    try {
+      const next = await call('set_check_settings', {
+        intervalHours: Number($('#csint').value),
+        notify: $('#csnotify').checked,
+        autostart: $('#csauto').checked,
+      });
+      render(ml, next, st, version);
+      toast('Checagem automática salva');
+    } catch {
+      render(ml, cs, st, version);
+    }
+  };
+  $('#cstest').onclick = async () => {
+    try {
+      await call('test_notification');
+      toast('Notificação enviada. Se não apareceu, confira as notificações do Windows');
+    } catch { /* call já mostrou o erro */ }
+  };
+
   // ---- backup ----
   const applyBackup = async (btn, fn, okMsg) => {
     setBusy(btn, true);
     try {
       const next = await fn();
-      render(ml, next, version);
+      render(ml, cs, next, version);
       toast(okMsg);
     } catch (e) {
       setBusy(btn, false);

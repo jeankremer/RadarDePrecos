@@ -23,7 +23,7 @@ const history = {
   2: [[at(18), R(112000)], [at(3), R(101900)], [at(0), R(101900, { inStock: false })]],
 };
 const link = (id, code, title) => ({ id, store: 'ml', code, title, url: url(code), image: '', lastCheck: at(0, new Date().getHours()), lastError: null, failures: 0 });
-let products = [{ id: 1, name: 'SSD Kingston NV3 1TB', links: [link(1, 'MLB39766120', 'SSD Kingston NV3 1TB M.2 2280'), link(2, 'MLB50970810', 'Kingston NV3 1TB - Preto')] }];
+let products = [{ id: 1, name: 'SSD Kingston NV3 1TB', targetPrice: 95000, minDropPct: 5, notifyLowest: true, links: [link(1, 'MLB39766120', 'SSD Kingston NV3 1TB M.2 2280'), link(2, 'MLB50970810', 'Kingston NV3 1TB - Preto')] }];
 
 const priceOn = (h, day) => {
   const r = h.filter(([a]) => a.slice(0, 10) <= day).at(-1)?.[1];
@@ -38,7 +38,8 @@ function summary(p) {
   const first = hist.map((h) => h[0]?.[0]).filter(Boolean).sort()[0];
   const bestOn = (day) => { const v = hist.map((h) => priceOn(h, day)).filter((x) => x != null); return v.length ? Math.min(...v) : null; };
   return {
-    id: p.id, name: p.name, targetPrice: null,
+    id: p.id, name: p.name, targetPrice: p.targetPrice ?? null, minDropPct: p.minDropPct ?? 5, notifyLowest: p.notifyLowest ?? true,
+    max30d: 104900, inflated: p.id === 1,
     links: p.links.map((l, i) => ({ ...l, current: hist[i].at(-1)?.[1] ?? null })),
     bestPrice: best, bestStore: best == null ? null : p.links[cur.indexOf(best)].store,
     lowestEver: all.length ? Math.min(...all) : null,
@@ -48,6 +49,11 @@ function summary(p) {
   };
 }
 
+let alerts = [
+  { id: 2, productId: 1, productName: 'SSD Kingston NV3 1TB', kind: 'lowest', priceBefore: 104900, priceAfter: 99700, at: at(1, 14), read: false },
+  { id: 1, productId: 1, productName: 'SSD Kingston NV3 1TB', kind: 'drop', priceBefore: 109900, priceAfter: 104900, at: at(5, 10), read: true },
+];
+let checks = { intervalHours: 3, notify: true, autostart: false, lastAutoCheck: at(0, 8), checking: false };
 let ml = { clientId: '417769415941125', redirectUri: 'https://gocomercio.com.br/oauth/mercadolivre/callback', hasSecret: true, connected: true, nickname: 'JEANK' };
 let backup = { dir: null, last: null, count: 0, error: null, suggestion: 'C:\\Users\\voce\\OneDrive\\Backups\\Radar de Precos' };
 const later = (v, ms = 500) => new Promise((r) => setTimeout(() => r(v), ms));
@@ -68,7 +74,14 @@ mockIPC((cmd, args) => {
       products.forEach((p) => (p.links = p.links.filter((l) => l.id !== args.id)));
       products = products.filter((p) => p.links.length);
       return null;
-    case 'check_now': return later({ checked: 2, changed: 1, failed: 0 }, 800);
+    case 'check_now': return later({ checked: 2, changed: 1, failed: 0, alerts: 0, suspicious: 0 }, 800);
+    case 'update_rules': Object.assign(products.find((x) => x.id === args.id), { targetPrice: args.target, minDropPct: args.minDropPct, notifyLowest: args.notifyLowest }); return null;
+    case 'list_alerts': return alerts;
+    case 'unread_alerts': return alerts.filter((a) => !a.read).length;
+    case 'mark_alerts_read': alerts = alerts.map((a) => ({ ...a, read: true })); emit('alerts', 0); return null;
+    case 'check_settings': return checks;
+    case 'set_check_settings': checks = { ...checks, intervalHours: args.intervalHours, notify: args.notify, autostart: args.autostart }; return checks;
+    case 'test_notification': return null;
     case 'ml_status': case 'ml_save_settings': return ml;
     case 'ml_disconnect': ml = { ...ml, connected: false, nickname: null }; return ml;
     case 'ml_connect':

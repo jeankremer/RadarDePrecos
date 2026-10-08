@@ -1,7 +1,7 @@
 // Tela "Acompanhando": lista de produtos, adicionar por link, checar agora e detalhe com histórico.
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { call, esc, toast, setBusy } from './core.js';
-import { brl, pct, ago, STORES } from './format.js';
+import { brl, pct, ago, STORES, parseCents } from './format.js';
 import { sparkline, stepChart } from './charts.js';
 import { chooseProduct } from './track.js';
 
@@ -18,7 +18,14 @@ export const productsModule = {
     openId ? showDetail(openId) : showList();
   },
   onFind() { $('#addurl')?.focus(); },
+  /** Chamado quando uma checagem termina. Não redesenha enquanto o usuário digita. */
+  refresh() {
+    if (root?.contains(document.activeElement) && document.activeElement.matches('input, select')) return;
+    openId ? showDetail(openId) : showList();
+  },
 };
+
+const INFLATED = (p) => `<span class="tag warn" title="O preço &quot;de&quot; está acima do maior preço visto nos últimos 30 dias (${brl(p.max30d)}). O desconto anunciado parece inflado.">Desconto inflado</span>`;
 
 const fmtPct = (v) => `${v > 0 ? '+' : ''}${String(v).replace('.', ',')}%`;
 
@@ -78,6 +85,7 @@ function row(p) {
       <div class="prow-price">
         <b>${brl(p.bestPrice)}</b>
         <span class="muted">${p.bestStore ? STORES[p.bestStore].name : 'sem estoque'}</span>
+        ${p.inflated ? INFLATED(p) : ''}
       </div>
       <div class="prow-meta">
         ${change ? `<span class="chg ${change < 0 ? 'down' : 'up'}">${fmtPct(change)}</span>` : '<span class="muted">—</span>'}
@@ -138,7 +146,8 @@ async function showDetail(id) {
           <input id="pname" class="title-input" value="${esc(p.name)}" maxlength="120" title="Edite e aperte Enter para renomear">
           <p class="muted">Menor agora: <b>${brl(p.bestPrice)}</b>${p.bestStore ? ` no ${STORES[p.bestStore].name}` : ''}
             · menor já visto: <b>${brl(p.lowestEver)}</b>
-            ${change ? ` · <span class="chg ${change < 0 ? 'down' : 'up'}">${fmtPct(change)} desde que começou</span>` : ''}</p>
+            ${change ? ` · <span class="chg ${change < 0 ? 'down' : 'up'}">${fmtPct(change)} desde que começou</span>` : ''}
+            ${p.inflated ? ` ${INFLATED(p)}` : ''}</p>
         </div>
         <button class="primary" id="check"><i class="ti ti-refresh"></i> Checar agora</button>
       </div>
@@ -149,6 +158,18 @@ async function showDetail(id) {
           <thead><tr><th>Loja</th><th>Produto</th><th>Menor preço</th><th>Checado</th><th></th></tr></thead>
           <tbody>${p.links.map(linkRow).join('')}</tbody>
         </table>
+      </section>
+      <section class="card">
+        <h3><i class="ti ti-bell"></i> Avisos</h3>
+        <form id="rulesf" class="rules-form" autocomplete="off">
+          <label>Preço-alvo <span class="pre">R$</span><input id="rtarget" value="${p.targetPrice != null ? (p.targetPrice / 100).toFixed(2).replace('.', ',') : ''}" placeholder="opcional"></label>
+          <label>Avisar quando cair pelo menos <input id="rdrop" type="number" min="0" max="90" step="1" value="${p.minDropPct}"><span class="pos">%</span></label>
+          <label class="check"><input id="rlowest" type="checkbox" ${p.notifyLowest ? 'checked' : ''}> Avisar no menor preço já visto</label>
+          <button class="small" id="rsave">Salvar</button>
+        </form>
+        <p class="error" id="rerr"></p>
+        <p class="muted">Os avisos aparecem em Alertas e como notificação do Windows. A primeira checagem nunca avisa,
+          e uma queda de mais de 60% só vira aviso depois de confirmada numa segunda leitura.</p>
       </section>
       <div class="danger-zone"><button class="ghost danger" id="del"><i class="ti ti-trash"></i> Parar de acompanhar</button></div>
     </div>`;
@@ -174,6 +195,19 @@ async function showDetail(id) {
       last ? showList() : showDetail(id);
     } catch { /* call já mostrou o erro */ }
   }));
+  $('#rulesf').oninput = () => { $('#rerr').textContent = ''; };
+  $('#rulesf').onsubmit = async (e) => {
+    e.preventDefault();
+    const target = parseCents($('#rtarget').value);
+    const minDropPct = Number($('#rdrop').value);
+    if (target === undefined) return ($('#rerr').textContent = 'Preço-alvo inválido. Use 89,90');
+    if (!Number.isFinite(minDropPct) || minDropPct < 0 || minDropPct > 90) return ($('#rerr').textContent = 'A queda mínima vai de 0% a 90%');
+    try {
+      await call('update_rules', { id, target, minDropPct, notifyLowest: $('#rlowest').checked });
+      toast('Avisos salvos');
+      $('#rsave').blur();
+    } catch { /* call já mostrou o erro */ }
+  };
   $('#del').onclick = async () => {
     if (!confirm(`Parar de acompanhar "${p.name}"? O histórico de preços será apagado.`)) return;
     try {

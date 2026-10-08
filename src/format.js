@@ -45,3 +45,27 @@ export function ago(iso, now = new Date()) {
 
 /** dd/mm de um timestamp em ms. */
 export const dayMonth = (ms) => dm(new Date(ms));
+
+/** Rótulo curto de um alerta (`kind` vem do Rust em snake_case). */
+export function alertText(a) {
+  switch (a.kind) {
+    case 'target': return 'Chegou ao preço-alvo';
+    case 'lowest': return 'Menor preço já visto';
+    case 'drop': return `Caiu ${Math.round(((a.priceBefore - a.priceAfter) / a.priceBefore) * 100)}%`;
+    case 'back_in_stock': return 'Voltou a ter oferta';
+    default: return a.kind;
+  }
+}
+
+/**
+ * "R$ 1.234,56" → 123456 centavos. Vazio → null. Inválido, zero ou negativo → undefined.
+ * Ponto é separador de milhar e vírgula é decimal (formato brasileiro).
+ */
+export function parseCents(text) {
+  const s = String(text ?? '').replace(/R\$|\s/g, '');
+  if (!s) return null;
+  if (!/^\d{1,3}(\.\d{3})*(,\d{1,2})?$|^\d+(,\d{1,2})?$/.test(s)) return undefined;
+  const [int, dec = ''] = s.replace(/\./g, '').split(',');
+  const cents = Number(int) * 100 + Number(dec.padEnd(2, '0'));
+  return cents > 0 ? cents : undefined;
+}
