@@ -777,3 +777,5 @@ table.links td { padding: 8px; border-bottom: 1px solid var(--border); vertical-
 }
 .card { background: var(--glass); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px 18px; margin: 14px 0; backdrop-filter: blur(14px); }
 .card h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+.detail-title { flex: 1; min-width: 0; }
+.title-input { width: 100%; text-overflow: ellipsis; }

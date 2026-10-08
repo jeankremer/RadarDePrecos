@@ -1,5 +1,6 @@
 //! Núcleo do Radar de Preços: banco local, Mercado Livre e comandos da interface.
 
+mod backup;
 mod db;
 mod ml;
 mod ml_auth;
@@ -536,8 +537,58 @@ fn delete_link(app: AppHandle, state: State<'_, AppState>, id: i64) -> CmdResult
     Ok(())
 }
 
-/// Chamado depois de cada mudança nos dados. A Tarefa 12 põe o backup aqui.
-fn after_change(_app: &AppHandle, _state: &AppState) {}
+/// Depois de cada mudança nos dados: backup do dia na pasta escolhida.
+/// Falhas não impedem a operação; aparecem no status do backup em Ajustes.
+fn after_change(app: &AppHandle, state: &AppState) {
+    if let Some(dir) = load_config(app).backup_dir {
+        let _ = backup::run(&lock(&state.db), Path::new(&dir), &today(), backup::KEEP);
+    }
+}
+
+// ---------- comandos: backup ----------
+
+#[tauri::command]
+fn backup_status(app: AppHandle) -> backup::BackupStatus {
+    backup::status(load_config(&app).backup_dir.as_deref())
+}
+
+#[tauri::command]
+fn set_backup_dir(app: AppHandle, state: State<'_, AppState>, dir: Option<String>) -> CmdResult<backup::BackupStatus> {
+    if let Some(d) = &dir {
+        backup::check_writable(Path::new(d))?;
+    }
+    let mut cfg = load_config(&app);
+    cfg.backup_dir = dir.clone();
+    save_config(&app, &cfg)?;
+    if let Some(d) = &dir {
+        backup::run(&lock(&state.db), Path::new(d), &today(), backup::KEEP)?;
+    }
+    Ok(backup::status(dir.as_deref()))
+}
+
+#[tauri::command]
+fn backup_now(app: AppHandle, state: State<'_, AppState>) -> CmdResult<backup::BackupStatus> {
+    let dir = load_config(&app).backup_dir.ok_or("Escolha uma pasta de backup primeiro")?;
+    backup::run(&lock(&state.db), Path::new(&dir), &today(), backup::KEEP)?;
+    Ok(backup::status(Some(&dir)))
+}
+
+/// Troca o banco atual por um backup. O atual é guardado ao lado, renomeado.
+#[tauri::command]
+fn restore_backup(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<()> {
+    let source = PathBuf::from(&path);
+    db::check_backup(&source)?;
+    let target = data_dir(&app)?.join(DB_FILE);
+    let keep = target.with_file_name(format!("radar-antes-restauracao-{}.db", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let mut conn = lock(&state.db);
+    conn.execute("VACUUM INTO ?1", [keep.to_string_lossy().into_owned()])
+        .map_err(|e| format!("Não foi possível guardar o banco atual: {e}"))?;
+    *conn = Connection::open_in_memory().map_err(err)?; // fecha o arquivo para poder substituir
+    let copied = fs::copy(&source, &target);
+    *conn = db::open(&target).map_err(err)?; // reabre mesmo se a cópia falhou
+    copied.map_err(|e| format!("Não foi possível restaurar: {e}"))?;
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -572,7 +623,11 @@ pub fn run() {
             product_detail,
             rename_product,
             delete_product,
-            delete_link
+            delete_link,
+            backup_status,
+            set_backup_dir,
+            backup_now,
+            restore_backup
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar o aplicativo");
